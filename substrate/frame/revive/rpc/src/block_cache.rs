@@ -61,7 +61,7 @@ impl<const N: usize> BlockCache<N> {
 	pub fn insert(
 		&mut self,
 		block: SubstrateBlock,
-		receipts: HashMap<H256, (TransactionSigned, ReceiptInfo)>,
+		receipts: Vec<(TransactionSigned, ReceiptInfo)>,
 	) {
 		if self.buffer.len() >= N {
 			if let Some(block) = self.buffer.pop_front() {
@@ -80,16 +80,20 @@ impl<const N: usize> BlockCache<N> {
 		if !receipts.is_empty() {
 			let values = receipts
 				.iter()
-				.map(|(hash, (_, receipt))| (receipt.transaction_index, *hash))
+				.map(|(_, receipt)| (receipt.transaction_index, receipt.transaction_hash))
 				.collect::<HashMap<_, _>>();
 
 			self.tx_hashes_by_block_and_index.insert(block.hash(), values);
 
-			self.receipts_by_hash
-				.extend(receipts.iter().map(|(hash, (_, receipt))| (*hash, receipt.clone())));
+			self.receipts_by_hash.extend(
+				receipts.iter().map(|(_, receipt)| (receipt.transaction_hash, receipt.clone())),
+			);
 
-			self.signed_tx_by_hash
-				.extend(receipts.iter().map(|(hash, (signed_tx, _))| (*hash, signed_tx.clone())))
+			self.signed_tx_by_hash.extend(
+				receipts
+					.iter()
+					.map(|(signed_tx, receipt)| (receipt.transaction_hash, signed_tx.clone())),
+			)
 		}
 
 		let block = Arc::new(block);

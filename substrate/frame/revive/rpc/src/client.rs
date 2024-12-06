@@ -227,7 +227,7 @@ impl ClientInner {
 	async fn receipt_infos(
 		&self,
 		block: &SubstrateBlock,
-	) -> Result<HashMap<H256, (TransactionSigned, ReceiptInfo)>, ClientError> {
+	) -> Result<Vec<(TransactionSigned, ReceiptInfo)>, ClientError> {
 		// Get extrinsics from the block
 		let extrinsics = block.extrinsics().await?;
 
@@ -300,18 +300,31 @@ impl ClientInner {
 					tx_info.r#type.unwrap_or_default()
 				);
 
-				Ok::<_, ClientError>((receipt.transaction_hash, (signed_tx, receipt)))
+				Ok::<_, ClientError>((signed_tx, receipt))
 			})
 			.buffer_unordered(10)
 			.collect::<Vec<Result<_, _>>>()
 			.await
 			.into_iter()
-			.collect::<Result<HashMap<_, _>, _>>()
+			.collect::<Result<Vec<_>, _>>()
 	}
 
-	async fn subscribe_blocks<F, Fut>(&self, callback: F)
+	/// Subscribe to past blocks executing the callback for each block.
+	/// The subscription keeps iterating past block until the closure returns false
+	/// Blocks are iterated starting from the latest block and walking backward
+	async fn subscribe_past_blocks<F, Fut>(&self, _callback: F)
 	where
 		F: Fn(SubstrateBlock, HashMap<H256, (TransactionSigned, ReceiptInfo)>) -> Fut + Send + Sync,
+		Fut: std::future::Future<Output = bool> + Send,
+	{
+		log::info!(target: LOG_TARGET, "Subscribing to past blocks");
+	}
+
+	/// Subscribe to new best blocks, and execute the async closure with
+	/// the extracted block and ethereum transactions
+	async fn subscribe_new_blocks<F, Fut>(&self, callback: F)
+	where
+		F: Fn(SubstrateBlock, Vec<(TransactionSigned, ReceiptInfo)>) -> Fut + Send + Sync,
 		Fut: std::future::Future<Output = ()> + Send,
 	{
 		log::info!(target: LOG_TARGET, "Subscribing to new blocks");
@@ -397,7 +410,7 @@ impl Client {
 		let inner = Arc::clone(&self.inner);
 		spawn_handle.spawn("subscribe-blocks", None, async move {
 			inner
-				.subscribe_blocks(|block, receipts| async {
+				.subscribe_new_blocks(|block, receipts| async {
 					let mut cache = inner.cache.write().await;
 					cache.insert(block, receipts);
 				})
