@@ -27,13 +27,17 @@ use pallet_revive::evm::*;
 use sp_core::{keccak_256, H160, H256, U256};
 use thiserror::Error;
 
-pub mod cli;
 pub mod client;
+pub mod eth_indexer_cli;
+pub mod eth_rpc_cli;
 pub mod example;
 pub mod subxt_client;
 
 #[cfg(test)]
 mod tests;
+
+mod block_cache;
+pub use block_cache::BlockCache;
 
 mod rpc_health;
 pub use rpc_health::*;

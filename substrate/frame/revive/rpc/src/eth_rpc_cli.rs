@@ -110,13 +110,17 @@ pub fn run(cmd: CliCommand) -> anyhow::Result<()> {
 
 	let tokio_runtime = sc_cli::build_runtime()?;
 	let tokio_handle = tokio_runtime.handle();
-	let signals = tokio_runtime.block_on(async { Signals::capture() })?;
 	let mut task_manager = TaskManager::new(tokio_handle.clone(), prometheus_registry)?;
 	let essential_spawn_handle = task_manager.spawn_essential_handle();
 
 	let gen_rpc_module = || {
 		let signals = tokio_runtime.block_on(async { Signals::capture() })?;
-		let fut = Client::from_url(&node_rpc_url, &essential_spawn_handle).fuse();
+		let fut = async {
+			let client = Client::from_url(&node_rpc_url).await?;
+			client.subscribe_and_cache_blocks(&essential_spawn_handle);
+			Ok::<_, crate::ClientError>(client)
+		}
+		.fuse();
 		pin_mut!(fut);
 
 		match tokio_handle.block_on(signals.try_until_signal(fut)) {
@@ -142,6 +146,7 @@ pub fn run(cmd: CliCommand) -> anyhow::Result<()> {
 		start_rpc_servers(&rpc_config, prometheus_registry, tokio_handle, gen_rpc_module, None)?;
 
 	task_manager.keep_alive(rpc_server_handle);
+	let signals = tokio_runtime.block_on(async { Signals::capture() })?;
 	tokio_runtime.block_on(signals.run_until_signal(task_manager.future().fuse()))?;
 	Ok(())
 }

@@ -7,10 +7,15 @@ license = "Apache-2.0"
 homepage.workspace = true
 repository.workspace = true
 description = "An Ethereum JSON-RPC server for pallet-revive."
+default-run = "eth-rpc"
 
 [[bin]]
 name = "eth-rpc"
-path = "src/main.rs"
+path = "src/eth_rpc.rs"
+
+[[bin]]
+name = "eth-indexer"
+path = "src/eth_indexer.rs"
 
 [[example]]
 name = "deploy"

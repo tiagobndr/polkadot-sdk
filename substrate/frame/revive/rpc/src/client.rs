@@ -22,7 +22,7 @@ use crate::{
 		revive::{calls::types::EthTransact, events::ContractEmitted},
 		runtime_types::pallet_revive::storage::ContractInfo,
 	},
-	LOG_TARGET,
+	BlockCache, LOG_TARGET,
 };
 use futures::{stream, StreamExt};
 use jsonrpsee::types::{error::CALL_EXECUTION_FAILED_CODE, ErrorObjectOwned};
@@ -36,11 +36,7 @@ use pallet_revive::{
 };
 use sp_core::keccak_256;
 use sp_weights::Weight;
-use std::{
-	collections::{HashMap, VecDeque},
-	sync::Arc,
-	time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use subxt::{
 	backend::{
 		legacy::{rpc_methods::SystemHealth, LegacyRpcMethods},
@@ -56,7 +52,7 @@ use subxt::{
 };
 use subxt_client::transaction_payment::events::TransactionFeePaid;
 use thiserror::Error;
-use tokio::sync::{watch::Sender, RwLock};
+use tokio::sync::RwLock;
 
 use crate::subxt_client::{self, system::events::ExtrinsicSuccess, SrcChainConfig};
 
@@ -74,29 +70,6 @@ pub type Shared<T> = Arc<RwLock<T>>;
 
 /// The runtime balance type.
 pub type Balance = u128;
-
-/// The cache maintains a buffer of the last N blocks,
-#[derive(Default)]
-struct BlockCache<const N: usize> {
-	/// A double-ended queue of the last N blocks.
-	/// The most recent block is at the back of the queue, and the oldest block is at the front.
-	buffer: VecDeque<Arc<SubstrateBlock>>,
-
-	/// A map of blocks by block number.
-	blocks_by_number: HashMap<SubstrateBlockNumber, Arc<SubstrateBlock>>,
-
-	/// A map of blocks by block hash.
-	blocks_by_hash: HashMap<H256, Arc<SubstrateBlock>>,
-
-	/// A map of receipts by hash.
-	receipts_by_hash: HashMap<H256, ReceiptInfo>,
-
-	/// A map of Signed transaction by hash.
-	signed_tx_by_hash: HashMap<H256, TransactionSigned>,
-
-	/// A map of receipt hashes by block hash.
-	tx_hashes_by_block_and_index: HashMap<H256, HashMap<U256, H256>>,
-}
 
 /// Unwrap the original `jsonrpsee::core::client::Error::Call` error.
 fn unwrap_call_err(err: &subxt::error::RpcError) -> Option<ErrorObjectOwned> {
@@ -214,45 +187,11 @@ impl From<ClientError> for ErrorObjectOwned {
 	}
 }
 
-/// The number of recent blocks maintained by the cache.
-/// For each block in the cache, we also store the EVM transaction receipts.
-pub const CACHE_SIZE: usize = 256;
-
-impl<const N: usize> BlockCache<N> {
-	fn latest_block(&self) -> Option<&Arc<SubstrateBlock>> {
-		self.buffer.back()
-	}
-
-	/// Insert an entry into the cache, and prune the oldest entry if the cache is full.
-	fn insert(&mut self, block: SubstrateBlock) {
-		if self.buffer.len() >= N {
-			if let Some(block) = self.buffer.pop_front() {
-				log::trace!(target: LOG_TARGET, "Pruning block: {}", block.number());
-				let hash = block.hash();
-				self.blocks_by_hash.remove(&hash);
-				self.blocks_by_number.remove(&block.number());
-				if let Some(entries) = self.tx_hashes_by_block_and_index.remove(&hash) {
-					for hash in entries.values() {
-						self.receipts_by_hash.remove(hash);
-					}
-				}
-			}
-		}
-
-		let block = Arc::new(block);
-		self.buffer.push_back(block.clone());
-		self.blocks_by_number.insert(block.number(), block.clone());
-		self.blocks_by_hash.insert(block.hash(), block);
-	}
-}
-
 /// A client connect to a node and maintains a cache of the last `CACHE_SIZE` blocks.
 #[derive(Clone)]
 pub struct Client {
 	/// The inner state of the client.
 	inner: Arc<ClientInner>,
-	/// A watch channel to signal cache updates.
-	pub updates: tokio::sync::watch::Receiver<()>,
 }
 
 /// The inner state of the client.
@@ -260,7 +199,7 @@ struct ClientInner {
 	api: OnlineClient<SrcChainConfig>,
 	rpc_client: ReconnectingRpcClient,
 	rpc: LegacyRpcMethods<SrcChainConfig>,
-	cache: Shared<BlockCache<CACHE_SIZE>>,
+	cache: Shared<BlockCache>,
 	chain_id: u64,
 	max_block_weight: Weight,
 }
@@ -274,7 +213,7 @@ impl ClientInner {
 			.await?;
 
 		let api = OnlineClient::<SrcChainConfig>::from_rpc_client(rpc_client.clone()).await?;
-		let cache = Arc::new(RwLock::new(BlockCache::<CACHE_SIZE>::default()));
+		let cache = Arc::new(RwLock::new(BlockCache::default()));
 
 		let rpc = LegacyRpcMethods::<SrcChainConfig>::new(RpcClient::new(rpc_client.clone()));
 
@@ -369,6 +308,53 @@ impl ClientInner {
 			.into_iter()
 			.collect::<Result<HashMap<_, _>, _>>()
 	}
+
+	async fn subscribe_blocks<F, Fut>(&self, callback: F)
+	where
+		F: Fn(SubstrateBlock, HashMap<H256, (TransactionSigned, ReceiptInfo)>) -> Fut + Send + Sync,
+		Fut: std::future::Future<Output = ()> + Send,
+	{
+		log::info!(target: LOG_TARGET, "Subscribing to new blocks");
+		let mut block_stream = match self.api.blocks().subscribe_best().await {
+			Ok(s) => s,
+			Err(err) => {
+				log::error!(target: LOG_TARGET, "Failed to subscribe to blocks: {err:?}");
+				return;
+			},
+		};
+
+		while let Some(block) = block_stream.next().await {
+			let block = match block {
+				Ok(block) => block,
+				Err(err) => {
+					if err.is_disconnected_will_reconnect() {
+						log::warn!(
+							target: LOG_TARGET,
+							"The RPC connection was lost and we may have missed a few blocks"
+						);
+						continue;
+					}
+
+					log::error!(target: LOG_TARGET, "Failed to fetch block: {err:?}");
+					return;
+				},
+			};
+
+			log::trace!(target: LOG_TARGET, "Pushing block: {}", block.number());
+
+			let receipts = self
+				.receipt_infos(&block)
+				.await
+				.inspect_err(|err| {
+					log::error!(target: LOG_TARGET, "Failed to get receipts: {err:?}");
+				})
+				.unwrap_or_default();
+
+			callback(block, receipts).await;
+		}
+
+		log::info!(target: LOG_TARGET, "Block subscription ended");
+	}
 }
 
 /// Fetch the chain ID from the substrate chain.
@@ -398,20 +384,25 @@ async fn extract_block_timestamp(block: &SubstrateBlock) -> Option<u64> {
 impl Client {
 	/// Create a new client instance.
 	/// The client will subscribe to new blocks and maintain a cache of [`CACHE_SIZE`] blocks.
-	pub async fn from_url(
-		url: &str,
-		spawn_handle: &sc_service::SpawnEssentialTaskHandle,
-	) -> Result<Self, ClientError> {
+	pub async fn from_url(url: &str) -> Result<Self, ClientError> {
 		log::info!(target: LOG_TARGET, "Connecting to node at: {url} ...");
 		let inner: Arc<ClientInner> = Arc::new(ClientInner::from_url(url).await?);
 		log::info!(target: LOG_TARGET, "Connected to node at: {url}");
 
-		let (tx, mut updates) = tokio::sync::watch::channel(());
+		Ok(Self { inner })
+	}
 
-		spawn_handle.spawn("subscribe-blocks", None, Self::subscribe_blocks(inner.clone(), tx));
-
-		updates.changed().await.expect("tx is not dropped");
-		Ok(Self { inner, updates })
+	/// Start the block subscription, and populate the block cache.
+	pub fn subscribe_and_cache_blocks(&self, spawn_handle: &sc_service::SpawnEssentialTaskHandle) {
+		let inner = Arc::clone(&self.inner);
+		spawn_handle.spawn("subscribe-blocks", None, async move {
+			inner
+				.subscribe_blocks(|block, receipts| async {
+					let mut cache = inner.cache.write().await;
+					cache.insert(block, receipts);
+				})
+				.await;
+		});
 	}
 
 	/// Expose the storage API.
@@ -464,69 +455,6 @@ impl Client {
 				Ok(api)
 			},
 		}
-	}
-
-	/// Subscribe to new blocks and update the cache.
-	async fn subscribe_blocks(inner: Arc<ClientInner>, tx: Sender<()>) {
-		log::info!(target: LOG_TARGET, "Subscribing to new blocks");
-		let mut block_stream = match inner.as_ref().api.blocks().subscribe_best().await {
-			Ok(s) => s,
-			Err(err) => {
-				log::error!(target: LOG_TARGET, "Failed to subscribe to blocks: {err:?}");
-				return;
-			},
-		};
-
-		while let Some(block) = block_stream.next().await {
-			let block = match block {
-				Ok(block) => block,
-				Err(err) => {
-					if err.is_disconnected_will_reconnect() {
-						log::warn!(
-							target: LOG_TARGET,
-							"The RPC connection was lost and we may have missed a few blocks"
-						);
-						continue;
-					}
-
-					log::error!(target: LOG_TARGET, "Failed to fetch block: {err:?}");
-					return;
-				},
-			};
-
-			log::trace!(target: LOG_TARGET, "Pushing block: {}", block.number());
-			let mut cache = inner.cache.write().await;
-
-			let receipts = inner
-				.receipt_infos(&block)
-				.await
-				.inspect_err(|err| {
-					log::error!(target: LOG_TARGET, "Failed to get receipts: {err:?}");
-				})
-				.unwrap_or_default();
-
-			if !receipts.is_empty() {
-				let values = receipts
-					.iter()
-					.map(|(hash, (_, receipt))| (receipt.transaction_index, *hash))
-					.collect::<HashMap<_, _>>();
-
-				cache.tx_hashes_by_block_and_index.insert(block.hash(), values);
-
-				cache
-					.receipts_by_hash
-					.extend(receipts.iter().map(|(hash, (_, receipt))| (*hash, receipt.clone())));
-
-				cache.signed_tx_by_hash.extend(
-					receipts.iter().map(|(hash, (signed_tx, _))| (*hash, signed_tx.clone())),
-				)
-			}
-
-			cache.insert(block);
-			tx.send_replace(());
-		}
-
-		log::info!(target: LOG_TARGET, "Block subscription ended");
 	}
 }
 
