@@ -16,7 +16,7 @@
 // limitations under the License.
 //! The Ethereum JSON-RPC server.
 use clap::Parser;
-use pallet_revive_eth_rpc::eth_indexer_cli as cli;
+use pallet_revive_eth_rpc::cli;
 
 fn main() -> anyhow::Result<()> {
 	let cmd = cli::CliCommand::parse();

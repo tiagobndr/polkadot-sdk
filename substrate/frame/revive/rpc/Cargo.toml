@@ -11,11 +11,7 @@ default-run = "eth-rpc"
 
 [[bin]]
 name = "eth-rpc"
-path = "src/eth_rpc.rs"
-
-[[bin]]
-name = "eth-indexer"
-path = "src/eth_indexer.rs"
+path = "src/main.rs"
 
 [[example]]
 name = "deploy"
