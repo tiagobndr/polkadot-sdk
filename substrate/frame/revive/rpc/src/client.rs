@@ -17,12 +17,13 @@
 //! The client connects to the source substrate chain
 //! and is used by the rpc server to query and send transactions to the substrate chain.
 use crate::{
+	block_cache::BlockCacheProvider,
 	runtime::GAS_PRICE,
 	subxt_client::{
 		revive::{calls::types::EthTransact, events::ContractEmitted},
 		runtime_types::pallet_revive::storage::ContractInfo,
 	},
-	BlockCache, LOG_TARGET,
+	LOG_TARGET,
 };
 use futures::{stream, StreamExt};
 use jsonrpsee::types::{error::CALL_EXECUTION_FAILED_CODE, ErrorObjectOwned};
@@ -36,7 +37,7 @@ use pallet_revive::{
 };
 use sp_core::keccak_256;
 use sp_weights::Weight;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{ops::ControlFlow, sync::Arc, time::Duration};
 use subxt::{
 	backend::{
 		legacy::{rpc_methods::SystemHealth, LegacyRpcMethods},
@@ -199,7 +200,7 @@ struct ClientInner {
 	api: OnlineClient<SrcChainConfig>,
 	rpc_client: ReconnectingRpcClient,
 	rpc: LegacyRpcMethods<SrcChainConfig>,
-	cache: Shared<BlockCache>,
+	cache_provider: BlockCacheProvider,
 	chain_id: u64,
 	max_block_weight: Weight,
 }
@@ -213,14 +214,13 @@ impl ClientInner {
 			.await?;
 
 		let api = OnlineClient::<SrcChainConfig>::from_rpc_client(rpc_client.clone()).await?;
-		let cache = Arc::new(RwLock::new(BlockCache::default()));
-
 		let rpc = LegacyRpcMethods::<SrcChainConfig>::new(RpcClient::new(rpc_client.clone()));
+		let cache_provider = BlockCacheProvider::default();
 
 		let (chain_id, max_block_weight) =
 			tokio::try_join!(chain_id(&api), max_block_weight(&api))?;
 
-		Ok(Self { api, rpc_client, rpc, cache, chain_id, max_block_weight })
+		Ok(Self { api, rpc_client, rpc, cache_provider, chain_id, max_block_weight })
 	}
 
 	/// Get the receipt infos from the extrinsics in a block.
@@ -310,14 +310,59 @@ impl ClientInner {
 	}
 
 	/// Subscribe to past blocks executing the callback for each block.
-	/// The subscription keeps iterating past block until the closure returns false
-	/// Blocks are iterated starting from the latest block and walking backward
-	async fn subscribe_past_blocks<F, Fut>(&self, _callback: F)
+	/// The subscription continues iterating past blocks until the closure returns
+	/// `ControlFlow::Break`. Blocks are iterated starting from the latest block and moving
+	/// backward.
+	#[allow(dead_code)]
+	async fn subscribe_past_blocks<F, Fut>(&self, callback: F)
 	where
-		F: Fn(SubstrateBlock, HashMap<H256, (TransactionSigned, ReceiptInfo)>) -> Fut + Send + Sync,
-		Fut: std::future::Future<Output = bool> + Send,
+		F: Fn(SubstrateBlock, Vec<(TransactionSigned, ReceiptInfo)>) -> Fut + Send + Sync,
+		Fut: std::future::Future<Output = ControlFlow<()>> + Send,
 	{
 		log::info!(target: LOG_TARGET, "Subscribing to past blocks");
+		let mut current = self.api.blocks().at_latest().await.ok();
+		loop {
+			let block = match current.take() {
+				Some(block) => block,
+				None => {
+					log::error!(target: LOG_TARGET, "Failed to fetch block");
+					return;
+				},
+			};
+			let block_number = block.number();
+			log::trace!(target: LOG_TARGET, "Processing block {block_number}");
+			let receipts = self
+				.receipt_infos(&block)
+				.await
+				.inspect_err(|err| {
+					log::error!(target: LOG_TARGET, "Failed to get receipts: {err:?}");
+				})
+				.unwrap_or_default();
+
+			let parent_hash = block.header().parent_hash;
+			match callback(block, receipts).await {
+				ControlFlow::Continue(_) => {
+					if block_number == 0 {
+						log::info!(target: LOG_TARGET, "All blocks processed");
+						break;
+					}
+
+					current = self
+						.api
+						.blocks()
+						.at(parent_hash)
+						.await
+						.inspect_err(|err| {
+							log::error!(target: LOG_TARGET, "Failed to fetch block: {err:?}");
+						})
+						.ok();
+				},
+				ControlFlow::Break(_) => {
+					log::info!(target: LOG_TARGET, "Stopping past block subscription");
+					break;
+				},
+			}
+		}
 	}
 
 	/// Subscribe to new best blocks, and execute the async closure with
@@ -411,8 +456,7 @@ impl Client {
 		spawn_handle.spawn("subscribe-blocks", None, async move {
 			inner
 				.subscribe_new_blocks(|block, receipts| async {
-					let mut cache = inner.cache.write().await;
-					cache.insert(block, receipts);
+					inner.cache_provider.ingest(block, receipts).await;
 				})
 				.await;
 		});
@@ -474,9 +518,8 @@ impl Client {
 impl Client {
 	/// Get the most recent block stored in the cache.
 	pub async fn latest_block(&self) -> Option<Arc<SubstrateBlock>> {
-		let cache = self.inner.cache.read().await;
-		let block = cache.latest_block()?;
-		Some(block.clone())
+		let block = self.inner.cache_provider.latest_block().await?;
+		Some(block)
 	}
 
 	/// Expose the transaction API.
@@ -491,8 +534,7 @@ impl Client {
 
 	/// Get an EVM transaction receipt by hash.
 	pub async fn receipt(&self, tx_hash: &H256) -> Option<ReceiptInfo> {
-		let cache = self.inner.cache.read().await;
-		cache.receipts_by_hash.get(tx_hash).cloned()
+		self.inner.cache_provider.receipt_by_hash(tx_hash).await
 	}
 
 	/// Get the syncing status of the chain.
@@ -523,22 +565,19 @@ impl Client {
 		block_hash: &H256,
 		transaction_index: &U256,
 	) -> Option<ReceiptInfo> {
-		let cache = self.inner.cache.read().await;
-		let receipt_hash =
-			cache.tx_hashes_by_block_and_index.get(block_hash)?.get(transaction_index)?;
-		let receipt = cache.receipts_by_hash.get(receipt_hash)?;
-		Some(receipt.clone())
+		self.inner
+			.cache_provider
+			.receipt_by_block_hash_and_index(block_hash, transaction_index)
+			.await
 	}
 
 	pub async fn signed_tx_by_hash(&self, tx_hash: &H256) -> Option<TransactionSigned> {
-		let cache = self.inner.cache.read().await;
-		cache.signed_tx_by_hash.get(tx_hash).cloned()
+		self.inner.cache_provider.signed_tx_by_hash(tx_hash).await
 	}
 
 	/// Get receipts count per block.
 	pub async fn receipts_count_per_block(&self, block_hash: &SubstrateBlockHash) -> Option<usize> {
-		let cache = self.inner.cache.read().await;
-		cache.tx_hashes_by_block_and_index.get(block_hash).map(|v| v.len())
+		self.inner.cache_provider.receipts_count_per_block(block_hash).await
 	}
 
 	/// Get the system health.
@@ -638,8 +677,8 @@ impl Client {
 
 	/// Get the block number of the latest block.
 	pub async fn block_number(&self) -> Result<SubstrateBlockNumber, ClientError> {
-		let cache = self.inner.cache.read().await;
-		let latest_block = cache.buffer.back().ok_or(ClientError::CacheEmpty)?;
+		let latest_block =
+			self.inner.cache_provider.latest_block().await.ok_or(ClientError::CacheEmpty)?;
 		Ok(latest_block.number())
 	}
 
@@ -648,8 +687,7 @@ impl Client {
 		&self,
 		block_number: SubstrateBlockNumber,
 	) -> Result<Option<SubstrateBlockHash>, ClientError> {
-		let cache = self.inner.cache.read().await;
-		if let Some(block) = cache.blocks_by_number.get(&block_number) {
+		if let Some(block) = self.inner.cache_provider.block_by_number(block_number).await {
 			return Ok(Some(block.hash()));
 		}
 
@@ -668,8 +706,8 @@ impl Client {
 				self.block_by_number(n).await
 			},
 			BlockNumberOrTag::BlockTag(_) => {
-				let cache = self.inner.cache.read().await;
-				Ok(cache.buffer.back().cloned())
+				let block = self.inner.cache_provider.latest_block().await;
+				Ok(block)
 			},
 		}
 	}
@@ -679,8 +717,7 @@ impl Client {
 		&self,
 		hash: &SubstrateBlockHash,
 	) -> Result<Option<Arc<SubstrateBlock>>, ClientError> {
-		let cache = self.inner.cache.read().await;
-		if let Some(block) = cache.blocks_by_hash.get(hash) {
+		if let Some(block) = self.inner.cache_provider.block_by_hash(hash).await {
 			return Ok(Some(block.clone()));
 		}
 
@@ -696,11 +733,12 @@ impl Client {
 		&self,
 		block_number: SubstrateBlockNumber,
 	) -> Result<Option<Arc<SubstrateBlock>>, ClientError> {
-		let cache = self.inner.cache.read().await;
-		if let Some(block) = cache.blocks_by_number.get(&block_number) {
+		// Get block from cache
+		if let Some(block) = self.inner.cache_provider.block_by_number(block_number).await {
 			return Ok(Some(block.clone()));
 		}
 
+		// If not in cache, get block from chain
 		let Some(hash) = self.get_block_hash(block_number).await? else {
 			return Ok(None);
 		};
