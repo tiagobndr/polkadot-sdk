@@ -20,22 +20,18 @@ use crate::{
 	block_cache::BlockCacheProvider,
 	runtime::GAS_PRICE,
 	subxt_client::{
-		revive::{calls::types::EthTransact, events::ContractEmitted},
-		runtime_types::pallet_revive::storage::ContractInfo,
+		revive::calls::types::EthTransact, runtime_types::pallet_revive::storage::ContractInfo,
 	},
 	LOG_TARGET,
 };
-use futures::{stream, StreamExt};
 use jsonrpsee::types::{error::CALL_EXECUTION_FAILED_CODE, ErrorObjectOwned};
 use pallet_revive::{
-	create1,
 	evm::{
-		Block, BlockNumberOrTag, BlockNumberOrTagOrHash, Bytes256, GenericTransaction, Log,
-		ReceiptInfo, SyncingProgress, SyncingStatus, TransactionSigned, H160, H256, U256,
+		Block, BlockNumberOrTag, BlockNumberOrTagOrHash, Bytes256, GenericTransaction, ReceiptInfo,
+		SyncingProgress, SyncingStatus, TransactionSigned, H160, H256, U256,
 	},
 	EthTransactError, EthTransactInfo,
 };
-use sp_core::keccak_256;
 use sp_weights::Weight;
 use std::{ops::ControlFlow, sync::Arc, time::Duration};
 use subxt::{
@@ -51,11 +47,10 @@ use subxt::{
 	storage::Storage,
 	Config, OnlineClient,
 };
-use subxt_client::transaction_payment::events::TransactionFeePaid;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-use crate::subxt_client::{self, system::events::ExtrinsicSuccess, SrcChainConfig};
+use crate::subxt_client::{self, SrcChainConfig};
 
 /// The substrate block type.
 pub type SubstrateBlock = subxt::blocks::Block<SrcChainConfig, OnlineClient<SrcChainConfig>>;
@@ -235,98 +230,12 @@ impl Client {
 
 		let api = OnlineClient::<SrcChainConfig>::from_rpc_client(rpc_client.clone()).await?;
 		let rpc = LegacyRpcMethods::<SrcChainConfig>::new(RpcClient::new(rpc_client.clone()));
-		let cache_provider = BlockCacheProvider::default();
+		let cache_provider = BlockCacheProvider::new(rpc.clone());
 
 		let (chain_id, max_block_weight) =
 			tokio::try_join!(chain_id(&api), max_block_weight(&api))?;
 
 		Ok(Self { api, rpc_client, rpc, cache_provider, chain_id, max_block_weight })
-	}
-
-	/// Get the receipt infos from the extrinsics in a block.
-	async fn receipt_infos(
-		&self,
-		block: &SubstrateBlock,
-	) -> Result<Vec<(TransactionSigned, ReceiptInfo)>, ClientError> {
-		// Get extrinsics from the block
-		let extrinsics = block.extrinsics().await?;
-
-		// Filter extrinsics from pallet_revive
-		let extrinsics = extrinsics.iter().flat_map(|ext| {
-			let call = ext.as_extrinsic::<EthTransact>().ok()??;
-			let transaction_hash = H256(keccak_256(&call.payload));
-			let signed_tx = TransactionSigned::decode(&call.payload).ok()?;
-			let from = signed_tx.recover_eth_address().ok()?;
-			let tx_info = GenericTransaction::from_signed(signed_tx.clone(), Some(from));
-			let contract_address = if tx_info.to.is_none() {
-				Some(create1(&from, tx_info.nonce.unwrap_or_default().try_into().ok()?))
-			} else {
-				None
-			};
-
-			Some((from, signed_tx, tx_info, transaction_hash, contract_address, ext))
-		});
-
-		// Map each extrinsic to a receipt
-		stream::iter(extrinsics)
-			.map(|(from, signed_tx, tx_info, transaction_hash, contract_address, ext)| async move {
-				let events = ext.events().await?;
-				let tx_fees =
-					events.find_first::<TransactionFeePaid>()?.ok_or(ClientError::TxFeeNotFound)?;
-
-				let gas_price = tx_info.gas_price.unwrap_or_default();
-				let gas_used = (tx_fees.tip.saturating_add(tx_fees.actual_fee))
-					.checked_div(gas_price.as_u128())
-					.unwrap_or_default();
-
-				let success = events.has::<ExtrinsicSuccess>()?;
-				let transaction_index = ext.index();
-				let block_hash = block.hash();
-				let block_number = block.number().into();
-
-				// get logs from ContractEmitted event
-				let logs = events.iter()
-					.filter_map(|event_details| {
-						let event_details = event_details.ok()?;
-						let event = event_details.as_event::<ContractEmitted>().ok()??;
-
-						Some(Log {
-							address: event.contract,
-							topics: event.topics,
-							data: Some(event.data.into()),
-							block_number: Some(block_number),
-							transaction_hash,
-							transaction_index: Some(transaction_index.into()),
-							block_hash: Some(block_hash),
-							log_index: Some(event_details.index().into()),
-							..Default::default()
-						})
-					}).collect();
-
-
-				log::debug!(target: LOG_TARGET, "Adding receipt for tx hash: {transaction_hash:?} - block: {block_number:?}");
-				let receipt = ReceiptInfo::new(
-					block_hash,
-					block_number,
-					contract_address,
-					from,
-					logs,
-					tx_info.to,
-					gas_price,
-					gas_used.into(),
-					success,
-					transaction_hash,
-					transaction_index.into(),
-					tx_info.r#type.unwrap_or_default()
-				);
-
-				Ok::<_, ClientError>((signed_tx, receipt))
-			})
-			.buffer_unordered(10)
-			.collect::<Vec<Result<_, _>>>()
-			.await
-			.into_iter()
-			.collect::<Result<Vec<_>, _>>()
 	}
 
 	/// Subscribe to past blocks executing the callback for each block.
@@ -336,7 +245,7 @@ impl Client {
 	#[allow(dead_code)]
 	async fn subscribe_past_blocks<F, Fut>(&self, callback: F)
 	where
-		F: Fn(SubstrateBlock, Vec<(TransactionSigned, ReceiptInfo)>) -> Fut + Send + Sync,
+		F: Fn(SubstrateBlock) -> Fut + Send + Sync,
 		Fut: std::future::Future<Output = ControlFlow<()>> + Send,
 	{
 		log::info!(target: LOG_TARGET, "Subscribing to past blocks");
@@ -351,16 +260,9 @@ impl Client {
 			};
 			let block_number = block.number();
 			log::trace!(target: LOG_TARGET, "Processing block {block_number}");
-			let receipts = self
-				.receipt_infos(&block)
-				.await
-				.inspect_err(|err| {
-					log::error!(target: LOG_TARGET, "Failed to get receipts: {err:?}");
-				})
-				.unwrap_or_default();
 
 			let parent_hash = block.header().parent_hash;
-			match callback(block, receipts).await {
+			match callback(block).await {
 				ControlFlow::Continue(_) => {
 					if block_number == 0 {
 						log::info!(target: LOG_TARGET, "All blocks processed");
@@ -389,7 +291,7 @@ impl Client {
 	/// the extracted block and ethereum transactions
 	async fn subscribe_new_blocks<F, Fut>(&self, callback: F)
 	where
-		F: Fn(SubstrateBlock, Vec<(TransactionSigned, ReceiptInfo)>) -> Fut + Send + Sync,
+		F: Fn(SubstrateBlock) -> Fut + Send + Sync,
 		Fut: std::future::Future<Output = ()> + Send,
 	{
 		log::info!(target: LOG_TARGET, "Subscribing to new blocks");
@@ -419,16 +321,7 @@ impl Client {
 			};
 
 			log::trace!(target: LOG_TARGET, "Pushing block: {}", block.number());
-
-			let receipts = self
-				.receipt_infos(&block)
-				.await
-				.inspect_err(|err| {
-					log::error!(target: LOG_TARGET, "Failed to get receipts: {err:?}");
-				})
-				.unwrap_or_default();
-
-			callback(block, receipts).await;
+			callback(block).await;
 		}
 
 		log::info!(target: LOG_TARGET, "Block subscription ended");
@@ -439,9 +332,7 @@ impl Client {
 		let client = self.clone();
 		spawn_handle.spawn("subscribe-blocks", None, async move {
 			client
-				.subscribe_new_blocks(|block, receipts| async {
-					client.cache_provider.ingest(block, receipts).await;
-				})
+				.subscribe_new_blocks(|block| async { client.cache_provider.ingest(block).await })
 				.await;
 		});
 	}

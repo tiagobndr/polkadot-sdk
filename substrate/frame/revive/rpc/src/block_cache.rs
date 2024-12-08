@@ -17,33 +17,135 @@
 
 use crate::{
 	client::{SubstrateBlock, SubstrateBlockNumber},
-	LOG_TARGET,
+	subxt_client::{
+		revive::{calls::types::EthTransact, events::ContractEmitted},
+		system::events::ExtrinsicSuccess,
+		transaction_payment::events::TransactionFeePaid,
+		SrcChainConfig,
+	},
+	ClientError, LOG_TARGET,
 };
-use pallet_revive::evm::{ReceiptInfo, TransactionSigned, H256, U256};
+use futures::{stream, StreamExt};
+use jsonrpsee::core::async_trait;
+use pallet_revive::{
+	create1,
+	evm::{GenericTransaction, Log, ReceiptInfo, TransactionSigned, H256, U256},
+};
+use sp_core::keccak_256;
 use std::{
 	collections::{HashMap, VecDeque},
 	sync::Arc,
 };
+use subxt::backend::legacy::LegacyRpcMethods;
 use tokio::sync::RwLock;
 
 /// The number of recent blocks maintained by the cache.
 /// For each block in the cache, we also store the EVM transaction receipts.
 pub const CACHE_SIZE: usize = 256;
 
-/// Abstraction over `SubstrateBlock` use to test `BlockCache` with `MockBlock`
-pub trait Block {
+#[async_trait]
+pub trait BlockInfo {
+	/// Returns the block hash.
 	fn hash(&self) -> H256;
+	/// Returns the block number.
 	fn number(&self) -> SubstrateBlockNumber;
+	/// Extract the EVM transactions and receipts for this block
+	async fn receipt_infos(&self) -> Result<Vec<(TransactionSigned, ReceiptInfo)>, ClientError>;
 }
 
-impl Block for SubstrateBlock {
+#[async_trait]
+impl BlockInfo for SubstrateBlock {
 	fn hash(&self) -> H256 {
 		SubstrateBlock::hash(&self)
 	}
 	fn number(&self) -> u32 {
 		SubstrateBlock::number(&self)
 	}
+
+	async fn receipt_infos(&self) -> Result<Vec<(TransactionSigned, ReceiptInfo)>, ClientError> {
+		// Get extrinsics from the block
+		let extrinsics = self.extrinsics().await?;
+		let block_hash = self.hash();
+		let block_number = U256::from(self.number());
+
+		// Filter extrinsics from pallet_revive
+		let extrinsics = extrinsics.iter().flat_map(|ext| {
+			let call = ext.as_extrinsic::<EthTransact>().ok()??;
+			let transaction_hash = H256(keccak_256(&call.payload));
+			let signed_tx = TransactionSigned::decode(&call.payload).ok()?;
+			let from = signed_tx.recover_eth_address().ok()?;
+			let tx_info = GenericTransaction::from_signed(signed_tx.clone(), Some(from));
+			let contract_address = if tx_info.to.is_none() {
+				Some(create1(&from, tx_info.nonce.unwrap_or_default().try_into().ok()?))
+			} else {
+				None
+			};
+
+			Some((from, signed_tx, tx_info, transaction_hash, contract_address, ext))
+		});
+
+		// Map each extrinsic to a receipt
+		stream::iter(extrinsics)
+			.map(|(from, signed_tx, tx_info, transaction_hash, contract_address, ext)| async move {
+				let events = ext.events().await?;
+				let tx_fees =
+					events.find_first::<TransactionFeePaid>()?.ok_or(ClientError::TxFeeNotFound)?;
+
+				let gas_price = tx_info.gas_price.unwrap_or_default();
+				let gas_used = (tx_fees.tip.saturating_add(tx_fees.actual_fee))
+					.checked_div(gas_price.as_u128())
+					.unwrap_or_default();
+
+				let success = events.has::<ExtrinsicSuccess>()?;
+				let transaction_index = ext.index();
+
+				// get logs from ContractEmitted event
+				let logs = events.iter()
+					.filter_map(|event_details| {
+						let event_details = event_details.ok()?;
+						let event = event_details.as_event::<ContractEmitted>().ok()??;
+
+						Some(Log {
+							address: event.contract,
+							topics: event.topics,
+							data: Some(event.data.into()),
+							block_number: Some(block_number),
+							transaction_hash,
+							transaction_index: Some(transaction_index.into()),
+							block_hash: Some(block_hash),
+							log_index: Some(event_details.index().into()),
+							..Default::default()
+						})
+					}).collect();
+
+
+				log::debug!(target: LOG_TARGET, "Adding receipt for tx hash: {transaction_hash:?} - block: {block_number:?}");
+				let receipt = ReceiptInfo::new(
+					block_hash,
+					block_number,
+					contract_address,
+					from,
+					logs,
+					tx_info.to,
+					gas_price,
+					gas_used.into(),
+					success,
+					transaction_hash,
+					transaction_index.into(),
+					tx_info.r#type.unwrap_or_default()
+				);
+
+				Ok::<_, ClientError>((signed_tx, receipt))
+			})
+			.buffer_unordered(10)
+			.collect::<Vec<Result<_, _>>>()
+			.await
+			.into_iter()
+			.collect::<Result<Vec<_>, _>>()
+	}
 }
+
+/// Get the receipt infos from the extrinsics in a block.
 
 /// The cache maintains a buffer of the last N blocks,
 #[derive(frame_support::DefaultNoBound)]
@@ -68,26 +170,45 @@ pub struct BlockCache<const N: usize, Block> {
 	tx_hashes_by_block_and_index: HashMap<H256, HashMap<U256, H256>>,
 }
 
-#[derive(frame_support::CloneNoBound, frame_support::DefaultNoBound)]
+#[derive(frame_support::CloneNoBound)]
 pub struct BlockCacheProvider<Block = SubstrateBlock> {
 	cache: Arc<RwLock<BlockCache<CACHE_SIZE, Block>>>,
+	rpc: LegacyRpcMethods<SrcChainConfig>,
 }
 
-impl<B: Block> BlockCacheProvider<B> {
+impl<B: BlockInfo> BlockCacheProvider<B> {
+	/// Create a new `BlockCacheProvider` with the given rpc client.
+	pub fn new(rpc: LegacyRpcMethods<SrcChainConfig>) -> Self {
+		Self { rpc, cache: Default::default() }
+	}
+}
+
+impl<B: BlockInfo> BlockCacheProvider<B> {
+	/// Get a read access on the shared cache.
 	async fn cache(&self) -> tokio::sync::RwLockReadGuard<'_, BlockCache<CACHE_SIZE, B>> {
 		self.cache.read().await
 	}
 
-	pub async fn ingest(&self, block: B, receipts: Vec<(TransactionSigned, ReceiptInfo)>) {
+	/// Ingest a new block.
+	pub async fn ingest(&self, block: B) {
+		let receipts = block
+			.receipt_infos()
+			.await
+			.inspect_err(|err| {
+				log::error!(target: LOG_TARGET, "Failed to get receipts for block: {}: {err:?}", block.number());
+			})
+			.unwrap_or_default();
 		let mut cache = self.cache.write().await;
 		cache.insert(block, receipts);
 	}
 
+	/// Latest ingested block.
 	pub async fn latest_block(&self) -> Option<Arc<B>> {
 		let cache = self.cache().await;
 		cache.buffer.back().cloned()
 	}
 
+	/// Find receipt by block hash and index
 	pub async fn receipt_by_block_hash_and_index(
 		&self,
 		block_hash: &H256,
@@ -97,36 +218,49 @@ impl<B: Block> BlockCacheProvider<B> {
 		let receipt_hash =
 			cache.tx_hashes_by_block_and_index.get(block_hash)?.get(transaction_index)?;
 		let receipt = cache.receipts_by_hash.get(receipt_hash)?;
+		// TODO if not found query db to find tx_hash for block and index, then use rpc to get block
+		// and receipt
 		Some(receipt.clone())
 	}
 
+	/// Get receipt count by block
 	pub async fn receipts_count_per_block(&self, block_hash: &H256) -> Option<usize> {
 		let cache = self.cache().await;
 		cache.tx_hashes_by_block_and_index.get(block_hash).map(|v| v.len())
+		// TODO if not found query db to find receipts for block_hash
+		// mean we need a second table ...
 	}
 
+	/// Get block by block_number.
 	pub async fn block_by_number(&self, number: SubstrateBlockNumber) -> Option<Arc<B>> {
 		let cache = self.cache().await;
 		cache.blocks_by_number.get(&number).cloned()
+		// TODO if not found query db then get block from RPC
 	}
 
+	/// Get block by block hash.
 	pub async fn block_by_hash(&self, hash: &H256) -> Option<Arc<B>> {
 		let cache = self.cache().await;
 		cache.blocks_by_hash.get(hash).cloned()
+		// TODO if not found query db then get block from RPC
 	}
 
+	/// Get receipts by transaction hash
 	pub async fn receipt_by_hash(&self, hash: &H256) -> Option<ReceiptInfo> {
 		let cache = self.cache().await;
 		cache.receipts_by_hash.get(hash).cloned()
+		// TODO query DB then get block and get receipt for tx
 	}
 
+	/// Get signed transaction by transaction hash.
 	pub async fn signed_tx_by_hash(&self, hash: &H256) -> Option<TransactionSigned> {
 		let cache = self.cache().await;
 		cache.signed_tx_by_hash.get(hash).cloned()
+		// TODO query DB then get block and get receipt for tx
 	}
 }
 
-impl<const N: usize, B: Block> BlockCache<N, B> {
+impl<const N: usize, B: BlockInfo> BlockCache<N, B> {
 	/// Insert an entry into the cache, and prune the oldest entry if the cache is full.
 	pub fn insert(&mut self, block: B, receipts: Vec<(TransactionSigned, ReceiptInfo)>) {
 		if self.buffer.len() >= N {
@@ -178,33 +312,35 @@ mod test {
 		block_hash: H256,
 	}
 
-	impl Block for MockBlock {
+	#[async_trait]
+	impl BlockInfo for MockBlock {
 		fn hash(&self) -> H256 {
 			self.block_hash
 		}
+
 		fn number(&self) -> u32 {
 			self.block_number
 		}
+
+		async fn receipt_infos(
+			&self,
+		) -> Result<Vec<(TransactionSigned, ReceiptInfo)>, ClientError> {
+			Ok(vec![(
+				TransactionSigned::default(),
+				ReceiptInfo { transaction_hash: self.hash(), ..Default::default() },
+			)])
+		}
 	}
 
-	#[test]
-	fn cache_insert_and_prune_works() {
+	#[tokio::test]
+	async fn cache_insert_and_prune_works() {
 		let mut cache = BlockCache::<2, MockBlock>::default();
 
-		let mut insert = |block_number: u8| {
-			let block_hash = H256::from([block_number; 32]);
-			cache.insert(
-				MockBlock { block_number: block_number.into(), block_hash },
-				vec![(
-					TransactionSigned::default(),
-					ReceiptInfo { transaction_hash: block_hash, ..Default::default() },
-				)],
-			);
-		};
-
-		insert(1);
-		insert(2);
-		insert(3);
+		for i in 1..=3 {
+			let block = MockBlock { block_number: i.into(), block_hash: H256::from([i; 32]) };
+			let receipts = block.receipt_infos().await.unwrap();
+			cache.insert(block, receipts)
+		}
 
 		assert_eq!(cache.buffer.len(), 2);
 		assert_eq!(cache.blocks_by_number.len(), 2);
