@@ -53,6 +53,7 @@ pub struct BlockCache<const N: usize = CACHE_SIZE> {
 	tx_hashes_by_block_and_index: HashMap<H256, HashMap<U256, H256>>,
 }
 
+#[derive(Clone)]
 pub struct BlockCacheProvider {
 	cache: Arc<RwLock<BlockCache<CACHE_SIZE>>>,
 }

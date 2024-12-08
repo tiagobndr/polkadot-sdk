@@ -191,12 +191,6 @@ impl From<ClientError> for ErrorObjectOwned {
 /// A client connect to a node and maintains a cache of the last `CACHE_SIZE` blocks.
 #[derive(Clone)]
 pub struct Client {
-	/// The inner state of the client.
-	inner: Arc<ClientInner>,
-}
-
-/// The inner state of the client.
-struct ClientInner {
 	api: OnlineClient<SrcChainConfig>,
 	rpc_client: ReconnectingRpcClient,
 	rpc: LegacyRpcMethods<SrcChainConfig>,
@@ -205,13 +199,39 @@ struct ClientInner {
 	max_block_weight: Weight,
 }
 
-impl ClientInner {
+/// Fetch the chain ID from the substrate chain.
+async fn chain_id(api: &OnlineClient<SrcChainConfig>) -> Result<u64, ClientError> {
+	let query = subxt_client::constants().revive().chain_id();
+	api.constants().at(&query).map_err(|err| err.into())
+}
+
+/// Fetch the max block weight from the substrate chain.
+async fn max_block_weight(api: &OnlineClient<SrcChainConfig>) -> Result<Weight, ClientError> {
+	let query = subxt_client::constants().system().block_weights();
+	let weights = api.constants().at(&query)?;
+	let max_block = weights.per_class.normal.max_extrinsic.unwrap_or(weights.max_block);
+	Ok(max_block.0)
+}
+
+/// Extract the block timestamp.
+async fn extract_block_timestamp(block: &SubstrateBlock) -> Option<u64> {
+	let extrinsics = block.extrinsics().await.ok()?;
+	let ext = extrinsics
+		.find_first::<crate::subxt_client::timestamp::calls::types::Set>()
+		.ok()??;
+
+	Some(ext.value.now / 1000)
+}
+
+impl Client {
 	/// Create a new client instance connecting to the substrate node at the given URL.
-	async fn from_url(url: &str) -> Result<Self, ClientError> {
+	pub async fn from_url(url: &str) -> Result<Self, ClientError> {
+		log::info!(target: LOG_TARGET, "Connecting to node at: {url} ...");
 		let rpc_client = ReconnectingRpcClient::builder()
 			.retry_policy(ExponentialBackoff::from_millis(100).max_delay(Duration::from_secs(10)))
 			.build(url.to_string())
 			.await?;
+		log::info!(target: LOG_TARGET, "Connected to node at: {url}");
 
 		let api = OnlineClient::<SrcChainConfig>::from_rpc_client(rpc_client.clone()).await?;
 		let rpc = LegacyRpcMethods::<SrcChainConfig>::new(RpcClient::new(rpc_client.clone()));
@@ -413,50 +433,14 @@ impl ClientInner {
 
 		log::info!(target: LOG_TARGET, "Block subscription ended");
 	}
-}
-
-/// Fetch the chain ID from the substrate chain.
-async fn chain_id(api: &OnlineClient<SrcChainConfig>) -> Result<u64, ClientError> {
-	let query = subxt_client::constants().revive().chain_id();
-	api.constants().at(&query).map_err(|err| err.into())
-}
-
-/// Fetch the max block weight from the substrate chain.
-async fn max_block_weight(api: &OnlineClient<SrcChainConfig>) -> Result<Weight, ClientError> {
-	let query = subxt_client::constants().system().block_weights();
-	let weights = api.constants().at(&query)?;
-	let max_block = weights.per_class.normal.max_extrinsic.unwrap_or(weights.max_block);
-	Ok(max_block.0)
-}
-
-/// Extract the block timestamp.
-async fn extract_block_timestamp(block: &SubstrateBlock) -> Option<u64> {
-	let extrinsics = block.extrinsics().await.ok()?;
-	let ext = extrinsics
-		.find_first::<crate::subxt_client::timestamp::calls::types::Set>()
-		.ok()??;
-
-	Some(ext.value.now / 1000)
-}
-
-impl Client {
-	/// Create a new client instance.
-	/// The client will subscribe to new blocks and maintain a cache of [`CACHE_SIZE`] blocks.
-	pub async fn from_url(url: &str) -> Result<Self, ClientError> {
-		log::info!(target: LOG_TARGET, "Connecting to node at: {url} ...");
-		let inner: Arc<ClientInner> = Arc::new(ClientInner::from_url(url).await?);
-		log::info!(target: LOG_TARGET, "Connected to node at: {url}");
-
-		Ok(Self { inner })
-	}
 
 	/// Start the block subscription, and populate the block cache.
 	pub fn subscribe_and_cache_blocks(&self, spawn_handle: &sc_service::SpawnEssentialTaskHandle) {
-		let inner = Arc::clone(&self.inner);
+		let client = self.clone();
 		spawn_handle.spawn("subscribe-blocks", None, async move {
-			inner
+			client
 				.subscribe_new_blocks(|block, receipts| async {
-					inner.cache_provider.ingest(block, receipts).await;
+					client.cache_provider.ingest(block, receipts).await;
 				})
 				.await;
 		});
@@ -473,14 +457,14 @@ impl Client {
 					(*block_number).try_into().map_err(|_| ClientError::ConversionFailed)?;
 
 				let hash = self.get_block_hash(n).await?.ok_or(ClientError::BlockNotFound)?;
-				Ok(self.inner.api.storage().at(hash))
+				Ok(self.api.storage().at(hash))
 			},
-			BlockNumberOrTagOrHash::H256(hash) => Ok(self.inner.api.storage().at(*hash)),
+			BlockNumberOrTagOrHash::H256(hash) => Ok(self.api.storage().at(*hash)),
 			BlockNumberOrTagOrHash::BlockTag(_) => {
 				if let Some(block) = self.latest_block().await {
-					return Ok(self.inner.api.storage().at(block.hash()));
+					return Ok(self.api.storage().at(block.hash()));
 				}
-				let storage = self.inner.api.storage().at_latest().await?;
+				let storage = self.api.storage().at_latest().await?;
 				Ok(storage)
 			},
 		}
@@ -500,25 +484,23 @@ impl Client {
 					(*block_number).try_into().map_err(|_| ClientError::ConversionFailed)?;
 
 				let hash = self.get_block_hash(n).await?.ok_or(ClientError::BlockNotFound)?;
-				Ok(self.inner.api.runtime_api().at(hash))
+				Ok(self.api.runtime_api().at(hash))
 			},
-			BlockNumberOrTagOrHash::H256(hash) => Ok(self.inner.api.runtime_api().at(*hash)),
+			BlockNumberOrTagOrHash::H256(hash) => Ok(self.api.runtime_api().at(*hash)),
 			BlockNumberOrTagOrHash::BlockTag(_) => {
 				if let Some(block) = self.latest_block().await {
-					return Ok(self.inner.api.runtime_api().at(block.hash()));
+					return Ok(self.api.runtime_api().at(block.hash()));
 				}
 
-				let api = self.inner.api.runtime_api().at_latest().await?;
+				let api = self.api.runtime_api().at_latest().await?;
 				Ok(api)
 			},
 		}
 	}
-}
 
-impl Client {
 	/// Get the most recent block stored in the cache.
 	pub async fn latest_block(&self) -> Option<Arc<SubstrateBlock>> {
-		let block = self.inner.cache_provider.latest_block().await?;
+		let block = self.cache_provider.latest_block().await?;
 		Some(block)
 	}
 
@@ -527,22 +509,22 @@ impl Client {
 		&self,
 		call: subxt::tx::DefaultPayload<EthTransact>,
 	) -> Result<H256, ClientError> {
-		let ext = self.inner.api.tx().create_unsigned(&call).map_err(ClientError::from)?;
+		let ext = self.api.tx().create_unsigned(&call).map_err(ClientError::from)?;
 		let hash = ext.submit().await?;
 		Ok(hash)
 	}
 
 	/// Get an EVM transaction receipt by hash.
 	pub async fn receipt(&self, tx_hash: &H256) -> Option<ReceiptInfo> {
-		self.inner.cache_provider.receipt_by_hash(tx_hash).await
+		self.cache_provider.receipt_by_hash(tx_hash).await
 	}
 
 	/// Get the syncing status of the chain.
 	pub async fn syncing(&self) -> Result<SyncingStatus, ClientError> {
-		let health = self.inner.rpc.system_health().await?;
+		let health = self.rpc.system_health().await?;
 
 		let status = if health.is_syncing {
-			let client = RpcClient::new(self.inner.rpc_client.clone());
+			let client = RpcClient::new(self.rpc_client.clone());
 			let sync_state: sc_rpc::system::SyncState<SubstrateBlockNumber> =
 				client.request("system_syncState", Default::default()).await?;
 
@@ -565,24 +547,23 @@ impl Client {
 		block_hash: &H256,
 		transaction_index: &U256,
 	) -> Option<ReceiptInfo> {
-		self.inner
-			.cache_provider
+		self.cache_provider
 			.receipt_by_block_hash_and_index(block_hash, transaction_index)
 			.await
 	}
 
 	pub async fn signed_tx_by_hash(&self, tx_hash: &H256) -> Option<TransactionSigned> {
-		self.inner.cache_provider.signed_tx_by_hash(tx_hash).await
+		self.cache_provider.signed_tx_by_hash(tx_hash).await
 	}
 
 	/// Get receipts count per block.
 	pub async fn receipts_count_per_block(&self, block_hash: &SubstrateBlockHash) -> Option<usize> {
-		self.inner.cache_provider.receipts_count_per_block(block_hash).await
+		self.cache_provider.receipts_count_per_block(block_hash).await
 	}
 
 	/// Get the system health.
 	pub async fn system_health(&self) -> Result<SystemHealth, ClientError> {
-		let health = self.inner.rpc.system_health().await?;
+		let health = self.rpc.system_health().await?;
 		Ok(health)
 	}
 
@@ -678,7 +659,7 @@ impl Client {
 	/// Get the block number of the latest block.
 	pub async fn block_number(&self) -> Result<SubstrateBlockNumber, ClientError> {
 		let latest_block =
-			self.inner.cache_provider.latest_block().await.ok_or(ClientError::CacheEmpty)?;
+			self.cache_provider.latest_block().await.ok_or(ClientError::CacheEmpty)?;
 		Ok(latest_block.number())
 	}
 
@@ -687,11 +668,11 @@ impl Client {
 		&self,
 		block_number: SubstrateBlockNumber,
 	) -> Result<Option<SubstrateBlockHash>, ClientError> {
-		if let Some(block) = self.inner.cache_provider.block_by_number(block_number).await {
+		if let Some(block) = self.cache_provider.block_by_number(block_number).await {
 			return Ok(Some(block.hash()));
 		}
 
-		let hash = self.inner.rpc.chain_get_block_hash(Some(block_number.into())).await?;
+		let hash = self.rpc.chain_get_block_hash(Some(block_number.into())).await?;
 		Ok(hash)
 	}
 
@@ -706,7 +687,7 @@ impl Client {
 				self.block_by_number(n).await
 			},
 			BlockNumberOrTag::BlockTag(_) => {
-				let block = self.inner.cache_provider.latest_block().await;
+				let block = self.cache_provider.latest_block().await;
 				Ok(block)
 			},
 		}
@@ -717,11 +698,11 @@ impl Client {
 		&self,
 		hash: &SubstrateBlockHash,
 	) -> Result<Option<Arc<SubstrateBlock>>, ClientError> {
-		if let Some(block) = self.inner.cache_provider.block_by_hash(hash).await {
+		if let Some(block) = self.cache_provider.block_by_hash(hash).await {
 			return Ok(Some(block.clone()));
 		}
 
-		match self.inner.api.blocks().at(*hash).await {
+		match self.api.blocks().at(*hash).await {
 			Ok(block) => Ok(Some(Arc::new(block))),
 			Err(subxt::Error::Block(subxt::error::BlockError::NotFound(_))) => Ok(None),
 			Err(err) => Err(err.into()),
@@ -734,7 +715,7 @@ impl Client {
 		block_number: SubstrateBlockNumber,
 	) -> Result<Option<Arc<SubstrateBlock>>, ClientError> {
 		// Get block from cache
-		if let Some(block) = self.inner.cache_provider.block_by_number(block_number).await {
+		if let Some(block) = self.cache_provider.block_by_number(block_number).await {
 			return Ok(Some(block.clone()));
 		}
 
@@ -748,7 +729,7 @@ impl Client {
 
 	/// Get the EVM block for the given hash.
 	pub async fn evm_block(&self, block: Arc<SubstrateBlock>) -> Result<Block, ClientError> {
-		let runtime_api = self.inner.api.runtime_api().at(block.hash());
+		let runtime_api = self.api.runtime_api().at(block.hash());
 		let max_fee = Self::weight_to_fee(&runtime_api, self.max_block_weight()).await?;
 		let gas_limit = U256::from(max_fee / GAS_PRICE as u128);
 
@@ -790,11 +771,11 @@ impl Client {
 
 	/// Get the chain ID.
 	pub fn chain_id(&self) -> u64 {
-		self.inner.chain_id
+		self.chain_id
 	}
 
 	/// Get the Max Block Weight.
 	pub fn max_block_weight(&self) -> Weight {
-		self.inner.max_block_weight
+		self.max_block_weight
 	}
 }
