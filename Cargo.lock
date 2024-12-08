@@ -14716,6 +14716,7 @@ dependencies = [
  "clap 4.5.13",
  "env_logger 0.11.3",
  "ethabi",
+ "frame-support 28.0.0",
  "futures",
  "hex",
  "hex-literal",

@@ -59,6 +59,7 @@ sc-rpc-api = { workspace = true, default-features = true }
 sc-cli = { workspace = true, default-features = true }
 sc-service = { workspace = true, default-features = true }
 prometheus-endpoint = { workspace = true, default-features = true }
+frame-support = { workspace = true, default-features = true }
 
 rlp = { workspace = true, optional = true }
 subxt-signer = { workspace = true, optional = true, features = [
