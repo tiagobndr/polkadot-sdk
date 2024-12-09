@@ -35,8 +35,11 @@ pub mod subxt_client;
 #[cfg(test)]
 mod tests;
 
-mod block_cache;
-pub use block_cache::BlockCache;
+mod block_info_provider;
+pub use block_info_provider::BlockInfoProvider;
+
+mod receipt_provider;
+pub use receipt_provider::ReceiptProvider;
 
 mod rpc_health;
 pub use rpc_health::*;
