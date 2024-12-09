@@ -17,11 +17,12 @@
 //! The client connects to the source substrate chain
 //! and is used by the rpc server to query and send transactions to the substrate chain.
 use crate::{
+	receipt_infos,
 	runtime::GAS_PRICE,
 	subxt_client::{
 		revive::calls::types::EthTransact, runtime_types::pallet_revive::storage::ContractInfo,
 	},
-	BlockInfoProvider, ReceiptProvider, LOG_TARGET,
+	BlockInfoProvider, CacheReceiptProvider, ReceiptProvider, LOG_TARGET,
 };
 use jsonrpsee::types::{error::CALL_EXECUTION_FAILED_CODE, ErrorObjectOwned};
 use pallet_revive::{
@@ -188,7 +189,7 @@ pub struct Client {
 	api: OnlineClient<SrcChainConfig>,
 	rpc_client: ReconnectingRpcClient,
 	rpc: LegacyRpcMethods<SrcChainConfig>,
-	receipt_provider: ReceiptProvider,
+	receipt_provider: CacheReceiptProvider,
 	block_provider: BlockInfoProvider,
 	chain_id: u64,
 	max_block_weight: Weight,
@@ -230,7 +231,7 @@ impl Client {
 
 		let api = OnlineClient::<SrcChainConfig>::from_rpc_client(rpc_client.clone()).await?;
 		let rpc = LegacyRpcMethods::<SrcChainConfig>::new(RpcClient::new(rpc_client.clone()));
-		let receipt_provider = ReceiptProvider::new(api.clone(), rpc.clone());
+		let receipt_provider = CacheReceiptProvider::default();
 		let block_provider = BlockInfoProvider::new(api.clone(), rpc.clone());
 
 		let (chain_id, max_block_weight) =
@@ -342,7 +343,14 @@ impl Client {
 		spawn_handle.spawn("subscribe-blocks", None, async move {
 			client
 				.subscribe_new_blocks(|block| async {
-					client.receipt_provider.insert(&block).await;
+					let receipts = receipt_infos(&block)
+						.await
+						.inspect_err(|err| {
+							log::error!(target: LOG_TARGET, "Failed to get receipts for block: {}: {err:?}", block.number());
+						})
+						.unwrap_or_default();
+
+					client.receipt_provider.insert(block.hash(), receipts).await;
 					if let Some(pruned) = client.block_provider.cache_block(block).await {
 						client.receipt_provider.remove(pruned).await;
 					}
