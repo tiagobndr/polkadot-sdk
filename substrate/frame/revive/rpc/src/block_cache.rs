@@ -31,7 +31,7 @@ use pallet_revive::{
 	create1,
 	evm::{GenericTransaction, Log, ReceiptInfo, TransactionSigned, H256, U256},
 };
-use sp_core::keccak_256;
+use sp_core::{keccak_256, H160};
 use std::{
 	collections::{HashMap, VecDeque},
 	sync::Arc,
@@ -51,6 +51,67 @@ pub trait BlockInfo {
 	fn number(&self) -> SubstrateBlockNumber;
 	/// Extract the EVM transactions and receipts for this block
 	async fn receipt_infos(&self) -> Result<Vec<(TransactionSigned, ReceiptInfo)>, ClientError>;
+}
+
+/// Extract the receipt information from an extrinsic.
+async fn extract_receipt_from_extrinsic(
+	block_number: U256,
+	block_hash: H256,
+	from: H160,
+	tx_info: GenericTransaction,
+	transaction_hash: H256,
+	contract_address: Option<H160>,
+	ext: subxt::blocks::ExtrinsicDetails<SrcChainConfig, subxt::OnlineClient<SrcChainConfig>>,
+) -> Result<ReceiptInfo, ClientError> {
+	let events = ext.events().await?;
+	let tx_fees = events.find_first::<TransactionFeePaid>()?.ok_or(ClientError::TxFeeNotFound)?;
+
+	let gas_price = tx_info.gas_price.unwrap_or_default();
+	let gas_used = (tx_fees.tip.saturating_add(tx_fees.actual_fee))
+		.checked_div(gas_price.as_u128())
+		.unwrap_or_default();
+
+	let success = events.has::<ExtrinsicSuccess>()?;
+	let transaction_index = ext.index();
+
+	// get logs from ContractEmitted event
+	let logs = events
+		.iter()
+		.filter_map(|event_details| {
+			let event_details = event_details.ok()?;
+			let event = event_details.as_event::<ContractEmitted>().ok()??;
+
+			Some(Log {
+				address: event.contract,
+				topics: event.topics,
+				data: Some(event.data.into()),
+				block_number: Some(block_number),
+				transaction_hash,
+				transaction_index: Some(transaction_index.into()),
+				block_hash: Some(block_hash),
+				log_index: Some(event_details.index().into()),
+				..Default::default()
+			})
+		})
+		.collect();
+
+	log::debug!(target: LOG_TARGET, "Adding receipt for tx hash: {transaction_hash:?} - block: {block_number:?}");
+	let receipt = ReceiptInfo::new(
+		block_hash,
+		block_number,
+		contract_address,
+		from,
+		logs,
+		tx_info.to,
+		gas_price,
+		gas_used.into(),
+		success,
+		transaction_hash,
+		transaction_index.into(),
+		tx_info.r#type.unwrap_or_default(),
+	);
+
+	Ok(receipt)
 }
 
 #[async_trait]
@@ -84,58 +145,19 @@ impl BlockInfo for SubstrateBlock {
 			Some((from, signed_tx, tx_info, transaction_hash, contract_address, ext))
 		});
 
-		// Map each extrinsic to a receipt
 		stream::iter(extrinsics)
 			.map(|(from, signed_tx, tx_info, transaction_hash, contract_address, ext)| async move {
-				let events = ext.events().await?;
-				let tx_fees =
-					events.find_first::<TransactionFeePaid>()?.ok_or(ClientError::TxFeeNotFound)?;
-
-				let gas_price = tx_info.gas_price.unwrap_or_default();
-				let gas_used = (tx_fees.tip.saturating_add(tx_fees.actual_fee))
-					.checked_div(gas_price.as_u128())
-					.unwrap_or_default();
-
-				let success = events.has::<ExtrinsicSuccess>()?;
-				let transaction_index = ext.index();
-
-				// get logs from ContractEmitted event
-				let logs = events.iter()
-					.filter_map(|event_details| {
-						let event_details = event_details.ok()?;
-						let event = event_details.as_event::<ContractEmitted>().ok()??;
-
-						Some(Log {
-							address: event.contract,
-							topics: event.topics,
-							data: Some(event.data.into()),
-							block_number: Some(block_number),
-							transaction_hash,
-							transaction_index: Some(transaction_index.into()),
-							block_hash: Some(block_hash),
-							log_index: Some(event_details.index().into()),
-							..Default::default()
-						})
-					}).collect();
-
-
-				log::debug!(target: LOG_TARGET, "Adding receipt for tx hash: {transaction_hash:?} - block: {block_number:?}");
-				let receipt = ReceiptInfo::new(
-					block_hash,
+				let receipt = extract_receipt_from_extrinsic(
 					block_number,
-					contract_address,
+					block_hash,
 					from,
-					logs,
-					tx_info.to,
-					gas_price,
-					gas_used.into(),
-					success,
+					tx_info,
 					transaction_hash,
-					transaction_index.into(),
-					tx_info.r#type.unwrap_or_default()
-				);
-
-				Ok::<_, ClientError>((signed_tx, receipt))
+					contract_address,
+					ext,
+				)
+				.await?;
+				Ok((signed_tx, receipt))
 			})
 			.buffer_unordered(10)
 			.collect::<Vec<Result<_, _>>>()
