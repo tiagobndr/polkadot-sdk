@@ -36,13 +36,16 @@ use std::{
 	collections::{HashMap, VecDeque},
 	sync::Arc,
 };
-use subxt::backend::legacy::LegacyRpcMethods;
+use subxt::{backend::legacy::LegacyRpcMethods, OnlineClient};
 use tokio::sync::RwLock;
 
 /// The number of recent blocks maintained by the cache.
 /// For each block in the cache, we also store the EVM transaction receipts.
 pub const CACHE_SIZE: usize = 256;
 
+/// Provides information about a block,
+/// This is an abstratction on top of [`SubstrateBlock`] to provide a common interface for
+/// [`BlockCache`].
 #[async_trait]
 pub trait BlockInfo {
 	/// Returns the block hash.
@@ -193,26 +196,29 @@ pub struct BlockCache<const N: usize, Block> {
 }
 
 #[derive(frame_support::CloneNoBound)]
-pub struct BlockCacheProvider<Block = SubstrateBlock> {
+pub struct BlockInfoProvider<Block = SubstrateBlock> {
 	cache: Arc<RwLock<BlockCache<CACHE_SIZE, Block>>>,
 	rpc: LegacyRpcMethods<SrcChainConfig>,
+	api: OnlineClient<SrcChainConfig>,
 }
 
-impl<B: BlockInfo> BlockCacheProvider<B> {
-	/// Create a new `BlockCacheProvider` with the given rpc client.
-	pub fn new(rpc: LegacyRpcMethods<SrcChainConfig>) -> Self {
-		Self { rpc, cache: Default::default() }
+impl<B: BlockInfo> BlockInfoProvider<B> {
+	/// Create a new `BlockInfoProvider` with the given rpc client.
+	pub fn new(api: OnlineClient<SrcChainConfig>, rpc: LegacyRpcMethods<SrcChainConfig>) -> Self {
+		Self { api, rpc, cache: Default::default() }
 	}
 }
 
-impl<B: BlockInfo> BlockCacheProvider<B> {
+impl BlockInfoProvider<SubstrateBlock> {
 	/// Get a read access on the shared cache.
-	async fn cache(&self) -> tokio::sync::RwLockReadGuard<'_, BlockCache<CACHE_SIZE, B>> {
+	async fn cache(
+		&self,
+	) -> tokio::sync::RwLockReadGuard<'_, BlockCache<CACHE_SIZE, SubstrateBlock>> {
 		self.cache.read().await
 	}
 
 	/// Ingest a new block.
-	pub async fn ingest(&self, block: B) {
+	pub async fn ingest(&self, block: SubstrateBlock) {
 		let receipts = block
 			.receipt_infos()
 			.await
@@ -225,7 +231,7 @@ impl<B: BlockInfo> BlockCacheProvider<B> {
 	}
 
 	/// Latest ingested block.
-	pub async fn latest_block(&self) -> Option<Arc<B>> {
+	pub async fn latest_block(&self) -> Option<Arc<SubstrateBlock>> {
 		let cache = self.cache().await;
 		cache.buffer.back().cloned()
 	}
@@ -254,17 +260,36 @@ impl<B: BlockInfo> BlockCacheProvider<B> {
 	}
 
 	/// Get block by block_number.
-	pub async fn block_by_number(&self, number: SubstrateBlockNumber) -> Option<Arc<B>> {
+	pub async fn block_by_number(
+		&self,
+		block_number: SubstrateBlockNumber,
+	) -> Result<Option<Arc<SubstrateBlock>>, ClientError> {
 		let cache = self.cache().await;
-		cache.blocks_by_number.get(&number).cloned()
-		// TODO if not found query db then get block from RPC
+		if let Some(block) = cache.blocks_by_number.get(&block_number).cloned() {
+			return Ok(Some(block));
+		}
+
+		let Some(hash) = self.rpc.chain_get_block_hash(Some(block_number.into())).await? else {
+			return Ok(None);
+		};
+		return self.block_by_hash(&hash).await;
 	}
 
 	/// Get block by block hash.
-	pub async fn block_by_hash(&self, hash: &H256) -> Option<Arc<B>> {
+	pub async fn block_by_hash(
+		&self,
+		hash: &H256,
+	) -> Result<Option<Arc<SubstrateBlock>>, ClientError> {
 		let cache = self.cache().await;
-		cache.blocks_by_hash.get(hash).cloned()
-		// TODO if not found query db then get block from RPC
+		if let Some(block) = cache.blocks_by_hash.get(hash).cloned() {
+			return Ok(Some(block));
+		}
+
+		match self.api.blocks().at(*hash).await {
+			Ok(block) => Ok(Some(Arc::new(block))),
+			Err(subxt::Error::Block(subxt::error::BlockError::NotFound(_))) => Ok(None),
+			Err(err) => Err(err.into()),
+		}
 	}
 
 	/// Get receipts by transaction hash

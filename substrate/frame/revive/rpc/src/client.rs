@@ -17,7 +17,7 @@
 //! The client connects to the source substrate chain
 //! and is used by the rpc server to query and send transactions to the substrate chain.
 use crate::{
-	block_cache::BlockCacheProvider,
+	block_cache::BlockInfoProvider,
 	runtime::GAS_PRICE,
 	subxt_client::{
 		revive::calls::types::EthTransact, runtime_types::pallet_revive::storage::ContractInfo,
@@ -189,7 +189,7 @@ pub struct Client {
 	api: OnlineClient<SrcChainConfig>,
 	rpc_client: ReconnectingRpcClient,
 	rpc: LegacyRpcMethods<SrcChainConfig>,
-	cache_provider: BlockCacheProvider,
+	block_info_provider: BlockInfoProvider,
 	chain_id: u64,
 	max_block_weight: Weight,
 }
@@ -230,12 +230,12 @@ impl Client {
 
 		let api = OnlineClient::<SrcChainConfig>::from_rpc_client(rpc_client.clone()).await?;
 		let rpc = LegacyRpcMethods::<SrcChainConfig>::new(RpcClient::new(rpc_client.clone()));
-		let cache_provider = BlockCacheProvider::new(rpc.clone());
+		let block_info_provider = BlockInfoProvider::new(api.clone(), rpc.clone());
 
 		let (chain_id, max_block_weight) =
 			tokio::try_join!(chain_id(&api), max_block_weight(&api))?;
 
-		Ok(Self { api, rpc_client, rpc, cache_provider, chain_id, max_block_weight })
+		Ok(Self { api, rpc_client, rpc, block_info_provider, chain_id, max_block_weight })
 	}
 
 	/// Subscribe to past blocks executing the callback for each block.
@@ -332,7 +332,9 @@ impl Client {
 		let client = self.clone();
 		spawn_handle.spawn("subscribe-blocks", None, async move {
 			client
-				.subscribe_new_blocks(|block| async { client.cache_provider.ingest(block).await })
+				.subscribe_new_blocks(|block| async {
+					client.block_info_provider.ingest(block).await
+				})
 				.await;
 		});
 	}
@@ -391,7 +393,7 @@ impl Client {
 
 	/// Get the most recent block stored in the cache.
 	pub async fn latest_block(&self) -> Option<Arc<SubstrateBlock>> {
-		let block = self.cache_provider.latest_block().await?;
+		let block = self.block_info_provider.latest_block().await?;
 		Some(block)
 	}
 
@@ -407,7 +409,7 @@ impl Client {
 
 	/// Get an EVM transaction receipt by hash.
 	pub async fn receipt(&self, tx_hash: &H256) -> Option<ReceiptInfo> {
-		self.cache_provider.receipt_by_hash(tx_hash).await
+		self.block_info_provider.receipt_by_hash(tx_hash).await
 	}
 
 	/// Get the syncing status of the chain.
@@ -438,18 +440,18 @@ impl Client {
 		block_hash: &H256,
 		transaction_index: &U256,
 	) -> Option<ReceiptInfo> {
-		self.cache_provider
+		self.block_info_provider
 			.receipt_by_block_hash_and_index(block_hash, transaction_index)
 			.await
 	}
 
 	pub async fn signed_tx_by_hash(&self, tx_hash: &H256) -> Option<TransactionSigned> {
-		self.cache_provider.signed_tx_by_hash(tx_hash).await
+		self.block_info_provider.signed_tx_by_hash(tx_hash).await
 	}
 
 	/// Get receipts count per block.
 	pub async fn receipts_count_per_block(&self, block_hash: &SubstrateBlockHash) -> Option<usize> {
-		self.cache_provider.receipts_count_per_block(block_hash).await
+		self.block_info_provider.receipts_count_per_block(block_hash).await
 	}
 
 	/// Get the system health.
@@ -550,7 +552,7 @@ impl Client {
 	/// Get the block number of the latest block.
 	pub async fn block_number(&self) -> Result<SubstrateBlockNumber, ClientError> {
 		let latest_block =
-			self.cache_provider.latest_block().await.ok_or(ClientError::CacheEmpty)?;
+			self.block_info_provider.latest_block().await.ok_or(ClientError::CacheEmpty)?;
 		Ok(latest_block.number())
 	}
 
@@ -559,12 +561,8 @@ impl Client {
 		&self,
 		block_number: SubstrateBlockNumber,
 	) -> Result<Option<SubstrateBlockHash>, ClientError> {
-		if let Some(block) = self.cache_provider.block_by_number(block_number).await {
-			return Ok(Some(block.hash()));
-		}
-
-		let hash = self.rpc.chain_get_block_hash(Some(block_number.into())).await?;
-		Ok(hash)
+		let maybe_block = self.block_info_provider.block_by_number(block_number).await?;
+		Ok(maybe_block.map(|block| block.hash()))
 	}
 
 	/// Get a block for the specified hash or number.
@@ -578,7 +576,7 @@ impl Client {
 				self.block_by_number(n).await
 			},
 			BlockNumberOrTag::BlockTag(_) => {
-				let block = self.cache_provider.latest_block().await;
+				let block = self.block_info_provider.latest_block().await;
 				Ok(block)
 			},
 		}
@@ -589,15 +587,7 @@ impl Client {
 		&self,
 		hash: &SubstrateBlockHash,
 	) -> Result<Option<Arc<SubstrateBlock>>, ClientError> {
-		if let Some(block) = self.cache_provider.block_by_hash(hash).await {
-			return Ok(Some(block.clone()));
-		}
-
-		match self.api.blocks().at(*hash).await {
-			Ok(block) => Ok(Some(Arc::new(block))),
-			Err(subxt::Error::Block(subxt::error::BlockError::NotFound(_))) => Ok(None),
-			Err(err) => Err(err.into()),
-		}
+		return self.block_info_provider.block_by_hash(hash).await;
 	}
 
 	/// Get a block by number
@@ -605,17 +595,7 @@ impl Client {
 		&self,
 		block_number: SubstrateBlockNumber,
 	) -> Result<Option<Arc<SubstrateBlock>>, ClientError> {
-		// Get block from cache
-		if let Some(block) = self.cache_provider.block_by_number(block_number).await {
-			return Ok(Some(block.clone()));
-		}
-
-		// If not in cache, get block from chain
-		let Some(hash) = self.get_block_hash(block_number).await? else {
-			return Ok(None);
-		};
-
-		self.block_by_hash(&hash).await
+		self.block_info_provider.block_by_number(block_number).await
 	}
 
 	/// Get the EVM block for the given hash.
