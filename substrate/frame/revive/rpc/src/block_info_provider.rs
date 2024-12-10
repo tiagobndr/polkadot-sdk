@@ -28,15 +28,21 @@ use std::{
 use subxt::{backend::legacy::LegacyRpcMethods, OnlineClient};
 use tokio::sync::RwLock;
 
+/// Provides information about blocks.
 #[derive(frame_support::CloneNoBound)]
 pub struct BlockInfoProvider {
+	/// The shared in memory cache.
 	cache: Arc<RwLock<BlockCache<SubstrateBlock>>>,
+
+	/// The rpc client, used to fetch blocks not in the cache.
 	rpc: LegacyRpcMethods<SrcChainConfig>,
+
+	/// The api client, used to fetch blocks not in the cache.
 	api: OnlineClient<SrcChainConfig>,
 }
 
 impl BlockInfoProvider {
-	/// Create a new `BlockInfoProvider` with the given rpc client.
+	/// Create a new `BlockInfoProvider` with the given cache size, rpc client and api client.
 	pub fn new(
 		cache_size: usize,
 		api: OnlineClient<SrcChainConfig>,
@@ -56,7 +62,7 @@ impl BlockInfoProvider {
 		cache.insert(block)
 	}
 
-	/// Latest ingested block.
+	/// Return the latest ingested block.
 	pub async fn latest_block(&self) -> Option<Arc<SubstrateBlock>> {
 		let cache = self.cache().await;
 		cache.buffer.back().cloned()
@@ -115,8 +121,7 @@ struct BlockCache<Block> {
 }
 
 /// Provides information about a block,
-/// This is an abstratction on top of [`SubstrateBlock`] to provide a common interface for
-/// [`BlockCache`].
+/// This is an abstratction on top of [`SubstrateBlock`] used to test the [`BlockCache`].
 trait BlockInfo {
 	/// Returns the block hash.
 	fn hash(&self) -> H256;
