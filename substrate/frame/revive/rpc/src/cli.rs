@@ -144,7 +144,7 @@ pub fn run(cmd: CliCommand) -> anyhow::Result<()> {
 		match tokio_handle.block_on(signals.try_until_signal(fut)) {
 			Ok(Ok(client)) => rpc_module(is_dev, client),
 			Ok(Err(err)) => {
-				log::error!("Error initializing the rpc: {err}");
+				log::error!("Error initializing: {err:?}");
 				Err(sc_service::Error::Application(err.into()))
 			},
 			Err(_) => Err(sc_service::Error::Application("Client connection interrupted".into())),
