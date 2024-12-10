@@ -51,15 +51,17 @@ impl ReceiptProvider for CacheReceiptProvider {
 		transaction_index: &U256,
 	) -> Option<ReceiptInfo> {
 		let cache = self.cache().await;
-		let receipt_hash =
-			cache.tx_hashes_by_block_and_index.get(block_hash)?.get(transaction_index)?;
+		let receipt_hash = cache
+			.transaction_hashes_by_block_and_index
+			.get(block_hash)?
+			.get(transaction_index)?;
 		let receipt = cache.receipts_by_hash.get(receipt_hash)?;
 		Some(receipt.clone())
 	}
 
 	async fn receipts_count_per_block(&self, block_hash: &H256) -> Option<usize> {
 		let cache = self.cache().await;
-		cache.tx_hashes_by_block_and_index.get(block_hash).map(|v| v.len())
+		cache.transaction_hashes_by_block_and_index.get(block_hash).map(|v| v.len())
 	}
 
 	async fn receipt_by_hash(&self, hash: &H256) -> Option<ReceiptInfo> {
@@ -82,7 +84,7 @@ struct ReceiptCache {
 	signed_tx_by_hash: HashMap<H256, TransactionSigned>,
 
 	/// A map of receipt hashes by block hash.
-	tx_hashes_by_block_and_index: HashMap<H256, HashMap<U256, H256>>,
+	transaction_hashes_by_block_and_index: HashMap<H256, HashMap<U256, H256>>,
 }
 
 impl ReceiptCache {
@@ -94,7 +96,7 @@ impl ReceiptCache {
 				.map(|(_, receipt)| (receipt.transaction_index, receipt.transaction_hash))
 				.collect::<HashMap<_, _>>();
 
-			self.tx_hashes_by_block_and_index.insert(*block_hash, values);
+			self.transaction_hashes_by_block_and_index.insert(*block_hash, values);
 
 			self.receipts_by_hash.extend(
 				receipts.iter().map(|(_, receipt)| (receipt.transaction_hash, receipt.clone())),
@@ -110,7 +112,7 @@ impl ReceiptCache {
 
 	/// Remove entry from the cache.
 	pub fn remove(&mut self, hash: &H256) {
-		if let Some(entries) = self.tx_hashes_by_block_and_index.remove(hash) {
+		if let Some(entries) = self.transaction_hashes_by_block_and_index.remove(hash) {
 			for hash in entries.values() {
 				self.receipts_by_hash.remove(hash);
 				self.signed_tx_by_hash.remove(hash);
@@ -139,7 +141,7 @@ mod test {
 		}
 
 		cache.remove(&H256::from([1u8; 32]));
-		assert_eq!(cache.tx_hashes_by_block_and_index.len(), 2);
+		assert_eq!(cache.transaction_hashes_by_block_and_index.len(), 2);
 		assert_eq!(cache.receipts_by_hash.len(), 2);
 		assert_eq!(cache.signed_tx_by_hash.len(), 2);
 	}

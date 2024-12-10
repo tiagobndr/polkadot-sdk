@@ -50,7 +50,7 @@ impl ReceiptProvider for DBReceiptProvider {
 			let transaction_index = receipt.transaction_index.as_u32() as i32;
 			let result = sqlx::query!(
 				r#"
-				INSERT INTO tx_hashes (transaction_hash, block_hash, transaction_index)
+				INSERT INTO transaction_hashes (transaction_hash, block_hash, transaction_index)
 				VALUES (?, ?, ?)
 				"#,
 				transaction_hash,
@@ -73,7 +73,7 @@ impl ReceiptProvider for DBReceiptProvider {
 		let row = sqlx::query!(
 			r#"
             SELECT COUNT(*) as count
-            FROM tx_hashes
+            FROM transaction_hashes
             WHERE block_hash = ?
             "#,
 			block_hash
@@ -102,7 +102,7 @@ impl ReceiptProvider for DBReceiptProvider {
 		let result = sqlx::query!(
 			r#"
 			SELECT block_hash, transaction_index
-			FROM tx_hashes
+			FROM transaction_hashes
 			WHERE transaction_hash = ?
 			"#,
 			transaction_hash
@@ -125,7 +125,7 @@ impl ReceiptProvider for DBReceiptProvider {
 		let result = sqlx::query!(
 			r#"
 			SELECT block_hash, transaction_index
-			FROM tx_hashes
+			FROM transaction_hashes
 			WHERE transaction_hash = ?
 			"#,
 			transaction_hash

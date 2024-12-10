@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n            SELECT COUNT(*) as count\n            FROM tx_hashes\n            WHERE block_hash = ?\n            ",
+  "query": "\n            SELECT COUNT(*) as count\n            FROM transaction_hashes\n            WHERE block_hash = ?\n            ",
   "describe": {
     "columns": [
       {
@@ -16,5 +16,5 @@
       false
     ]
   },
-  "hash": "86c55880db97afbde742d2c1ffc85784ca326ad737c815725646896edd691fba"
+  "hash": "3e34e8e4bdeba2c5f2de915301d20958b338f9fef0d2575056f74f8c67bc3966"
 }
