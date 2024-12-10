@@ -20,6 +20,7 @@ use pallet_revive::evm::{ReceiptInfo, TransactionSigned, H256, U256};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
+/// A `[ReceiptProvider]` that caches receipts in memory.
 #[derive(Clone, Default)]
 pub struct CacheReceiptProvider {
 	cache: Arc<RwLock<ReceiptCache>>,
@@ -74,7 +75,7 @@ impl ReceiptProvider for CacheReceiptProvider {
 
 #[derive(Default)]
 struct ReceiptCache {
-	/// A map of receipts by traansaction hash.
+	/// A map of receipts by transaction hash.
 	receipts_by_hash: HashMap<H256, ReceiptInfo>,
 
 	/// A map of Signed transaction by transaction hash.
@@ -129,15 +130,15 @@ mod test {
 		for i in 1u8..=3 {
 			let hash = H256::from([i; 32]);
 			cache.insert(
-				hash,
-				vec![(
+				&hash,
+				&[(
 					TransactionSigned::default(),
 					ReceiptInfo { transaction_hash: hash, ..Default::default() },
 				)],
 			);
 		}
 
-		cache.remove(H256::from([1u8; 32]));
+		cache.remove(&H256::from([1u8; 32]));
 		assert_eq!(cache.tx_hashes_by_block_and_index.len(), 2);
 		assert_eq!(cache.receipts_by_hash.len(), 2);
 		assert_eq!(cache.signed_tx_by_hash.len(), 2);

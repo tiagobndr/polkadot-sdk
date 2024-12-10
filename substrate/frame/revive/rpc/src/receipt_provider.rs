@@ -39,12 +39,13 @@ pub use cache::CacheReceiptProvider;
 mod db;
 pub use db::DBReceiptProvider;
 
+/// Provide means to store and retrieve receipts.
 #[async_trait]
 pub trait ReceiptProvider: Send + Sync {
 	/// Insert receipts into the provider.
 	async fn insert(&self, block_hash: &H256, receipts: &[(TransactionSigned, ReceiptInfo)]);
 
-	/// Remove receipts from the provider with the given block hash.
+	/// Remove receipts with the given block hash.
 	async fn remove(&self, block_hash: &H256);
 
 	/// Get the receipt for the given block hash and transaction index.

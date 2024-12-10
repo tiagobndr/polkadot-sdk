@@ -21,13 +21,17 @@ use pallet_revive::evm::{ReceiptInfo, TransactionSigned};
 use sp_core::{H256, U256};
 use sqlx::SqlitePool;
 
+/// A `[ReceiptProvider]` that stores receipts in a SQLite database.
 #[derive(Clone)]
 pub struct DBReceiptProvider {
+	/// The SQLite database pool.
 	pool: SqlitePool,
+	/// The block provider used to fetch blocks, and reconstruct receipts.
 	block_provider: BlockInfoProvider,
 }
 
 impl DBReceiptProvider {
+	/// Create a new `DBReceiptProvider` with the given database URL and block provider.
 	pub async fn new(
 		database_url: &str,
 		block_provider: BlockInfoProvider,
