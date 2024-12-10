@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n\t\t\t\tINSERT INTO tx_hashes (transaction_hash, block_hash, transaction_index)\n\t\t\t\tVALUES (?, ?, ?)\n\t\t\t\t",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "c4f29821c4a3fb0e40b603924066ee3749b3b27c7ae118507f8f07c2456cdc6c"
+}

@@ -43,10 +43,10 @@ trait BlockInfo {
 
 impl BlockInfo for SubstrateBlock {
 	fn hash(&self) -> H256 {
-		SubstrateBlock::hash(&self)
+		SubstrateBlock::hash(self)
 	}
 	fn number(&self) -> u32 {
-		SubstrateBlock::number(&self)
+		SubstrateBlock::number(self)
 	}
 }
 
@@ -109,7 +109,8 @@ impl BlockInfoProvider {
 		let Some(hash) = self.rpc.chain_get_block_hash(Some(block_number.into())).await? else {
 			return Ok(None);
 		};
-		return self.block_by_hash(&hash).await;
+
+		self.block_by_hash(&hash).await
 	}
 
 	/// Get block by block hash.
@@ -148,7 +149,7 @@ impl<const N: usize, B: BlockInfo> BlockCache<N, B> {
 		self.buffer.push_back(block.clone());
 		self.blocks_by_number.insert(block.number(), block.clone());
 		self.blocks_by_hash.insert(block.hash(), block);
-		return pruned_block_hash;
+		pruned_block_hash
 	}
 }
 

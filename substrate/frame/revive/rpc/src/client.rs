@@ -17,12 +17,12 @@
 //! The client connects to the source substrate chain
 //! and is used by the rpc server to query and send transactions to the substrate chain.
 use crate::{
-	receipt_infos,
+	extract_receipts_from_block,
 	runtime::GAS_PRICE,
 	subxt_client::{
 		revive::calls::types::EthTransact, runtime_types::pallet_revive::storage::ContractInfo,
 	},
-	BlockInfoProvider, CacheReceiptProvider, ReceiptProvider, LOG_TARGET,
+	BlockInfoProvider, CacheReceiptProvider, DBReceiptProvider, ReceiptProvider, LOG_TARGET,
 };
 use jsonrpsee::types::{error::CALL_EXECUTION_FAILED_CODE, ErrorObjectOwned};
 use pallet_revive::{
@@ -136,6 +136,9 @@ pub enum ClientError {
 	/// A [`RpcError`] wrapper error.
 	#[error(transparent)]
 	RpcError(#[from] RpcError),
+	/// A [`sqlx::Error`] wrapper error.
+	#[error(transparent)]
+	SqlxError(#[from] sqlx::Error),
 	/// A [`codec::Error`] wrapper error.
 	#[error(transparent)]
 	CodecError(#[from] codec::Error),
@@ -148,9 +151,18 @@ pub enum ClientError {
 	/// The block hash was not found.
 	#[error("hash not found")]
 	BlockNotFound,
+
+	#[error("No Ethereum extrinsic found")]
+	EthExtrinsicNotFound,
 	/// The transaction fee could not be found
 	#[error("transactionFeePaid event not found")]
 	TxFeeNotFound,
+	/// Failed to decode a raw payload into a signed transaction.
+	#[error("Failed to decode a raw payload into a signed transaction")]
+	TxDecodingFailed,
+	/// Failed to recover eth address.
+	#[error("failed to recover eth address")]
+	RecoverEthAddressFailed,
 	/// The cache is empty.
 	#[error("cache is empty")]
 	CacheEmpty,
@@ -189,7 +201,7 @@ pub struct Client {
 	api: OnlineClient<SrcChainConfig>,
 	rpc_client: ReconnectingRpcClient,
 	rpc: LegacyRpcMethods<SrcChainConfig>,
-	receipt_provider: CacheReceiptProvider,
+	receipt_provider: Arc<dyn ReceiptProvider>,
 	block_provider: BlockInfoProvider,
 	chain_id: u64,
 	max_block_weight: Weight,
@@ -221,18 +233,26 @@ async fn extract_block_timestamp(block: &SubstrateBlock) -> Option<u64> {
 
 impl Client {
 	/// Create a new client instance connecting to the substrate node at the given URL.
-	pub async fn from_url(url: &str) -> Result<Self, ClientError> {
-		log::info!(target: LOG_TARGET, "Connecting to node at: {url} ...");
+	pub async fn new(node_rpc_url: &str, database_url: Option<&str>) -> Result<Self, ClientError> {
+		log::info!(target: LOG_TARGET, "Connecting to node at: {node_rpc_url} ...");
 		let rpc_client = ReconnectingRpcClient::builder()
 			.retry_policy(ExponentialBackoff::from_millis(100).max_delay(Duration::from_secs(10)))
-			.build(url.to_string())
+			.build(node_rpc_url.to_string())
 			.await?;
-		log::info!(target: LOG_TARGET, "Connected to node at: {url}");
+		log::info!(target: LOG_TARGET, "Connected to node at: {node_rpc_url}");
 
 		let api = OnlineClient::<SrcChainConfig>::from_rpc_client(rpc_client.clone()).await?;
 		let rpc = LegacyRpcMethods::<SrcChainConfig>::new(RpcClient::new(rpc_client.clone()));
-		let receipt_provider = CacheReceiptProvider::default();
+
 		let block_provider = BlockInfoProvider::new(api.clone(), rpc.clone());
+		let receipt_provider: Arc<dyn ReceiptProvider> = if let Some(database_url) = database_url {
+			Arc::new((
+				CacheReceiptProvider::default(),
+				DBReceiptProvider::new(database_url, block_provider.clone()).await?,
+			))
+		} else {
+			Arc::new(CacheReceiptProvider::default())
+		};
 
 		let (chain_id, max_block_weight) =
 			tokio::try_join!(chain_id(&api), max_block_weight(&api))?;
@@ -343,16 +363,16 @@ impl Client {
 		spawn_handle.spawn("subscribe-blocks", None, async move {
 			client
 				.subscribe_new_blocks(|block| async {
-					let receipts = receipt_infos(&block)
+					let receipts = extract_receipts_from_block(&block)
 						.await
 						.inspect_err(|err| {
 							log::error!(target: LOG_TARGET, "Failed to get receipts for block: {}: {err:?}", block.number());
 						})
 						.unwrap_or_default();
 
-					client.receipt_provider.insert(block.hash(), receipts).await;
+					client.receipt_provider.insert(&block.hash(), &receipts).await;
 					if let Some(pruned) = client.block_provider.cache_block(block).await {
-						client.receipt_provider.remove(pruned).await;
+						client.receipt_provider.remove(&pruned).await;
 					}
 				})
 				.await;
@@ -607,7 +627,7 @@ impl Client {
 		&self,
 		hash: &SubstrateBlockHash,
 	) -> Result<Option<Arc<SubstrateBlock>>, ClientError> {
-		return self.block_provider.block_by_hash(hash).await;
+		self.block_provider.block_by_hash(hash).await
 	}
 
 	/// Get a block by number

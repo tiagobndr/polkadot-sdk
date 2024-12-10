@@ -34,12 +34,12 @@ impl CacheReceiptProvider {
 
 #[async_trait]
 impl ReceiptProvider for CacheReceiptProvider {
-	async fn insert(&self, block_hash: H256, receipts: Vec<(TransactionSigned, ReceiptInfo)>) {
+	async fn insert(&self, block_hash: &H256, receipts: &[(TransactionSigned, ReceiptInfo)]) {
 		let mut cache = self.cache.write().await;
 		cache.insert(block_hash, receipts);
 	}
 
-	async fn remove(&self, block_hash: H256) {
+	async fn remove(&self, block_hash: &H256) {
 		let mut cache = self.cache.write().await;
 		cache.remove(block_hash);
 	}
@@ -86,14 +86,14 @@ struct ReceiptCache {
 
 impl ReceiptCache {
 	/// Insert new receipts into the cache.
-	pub fn insert(&mut self, block_hash: H256, receipts: Vec<(TransactionSigned, ReceiptInfo)>) {
+	pub fn insert(&mut self, block_hash: &H256, receipts: &[(TransactionSigned, ReceiptInfo)]) {
 		if !receipts.is_empty() {
 			let values = receipts
 				.iter()
 				.map(|(_, receipt)| (receipt.transaction_index, receipt.transaction_hash))
 				.collect::<HashMap<_, _>>();
 
-			self.tx_hashes_by_block_and_index.insert(block_hash, values);
+			self.tx_hashes_by_block_and_index.insert(*block_hash, values);
 
 			self.receipts_by_hash.extend(
 				receipts.iter().map(|(_, receipt)| (receipt.transaction_hash, receipt.clone())),
@@ -108,8 +108,8 @@ impl ReceiptCache {
 	}
 
 	/// Remove entry from the cache.
-	pub fn remove(&mut self, hash: H256) {
-		if let Some(entries) = self.tx_hashes_by_block_and_index.remove(&hash) {
+	pub fn remove(&mut self, hash: &H256) {
+		if let Some(entries) = self.tx_hashes_by_block_and_index.remove(hash) {
 			for hash in entries.values() {
 				self.receipts_by_hash.remove(hash);
 				self.signed_tx_by_hash.remove(hash);

@@ -42,6 +42,12 @@ pub struct CliCommand {
 	#[clap(long, default_value = "ws://127.0.0.1:9944")]
 	pub node_rpc_url: String,
 
+	/// The database used to store Ethereum transaction hashes.
+	/// This is only useful if the node needs to act as an archive node and respond to Ethereum RPC
+	/// querires for transactions that are not in the in memory cache.
+	#[clap(long)]
+	pub database_url: Option<String>,
+
 	#[allow(missing_docs)]
 	#[clap(flatten)]
 	pub shared_params: SharedParams,
@@ -78,7 +84,9 @@ fn init_logger(params: &SharedParams) -> anyhow::Result<()> {
 
 /// Start the JSON-RPC server using the given command line arguments.
 pub fn run(cmd: CliCommand) -> anyhow::Result<()> {
-	let CliCommand { rpc_params, prometheus_params, node_rpc_url, shared_params, .. } = cmd;
+	let CliCommand {
+		rpc_params, prometheus_params, node_rpc_url, database_url, shared_params, ..
+	} = cmd;
 
 	#[cfg(not(test))]
 	init_logger(&shared_params)?;
@@ -116,7 +124,7 @@ pub fn run(cmd: CliCommand) -> anyhow::Result<()> {
 	let gen_rpc_module = || {
 		let signals = tokio_runtime.block_on(async { Signals::capture() })?;
 		let fut = async {
-			let client = Client::from_url(&node_rpc_url).await?;
+			let client = Client::new(&node_rpc_url, database_url.as_deref()).await?;
 			client.subscribe_and_cache_blocks(&essential_spawn_handle);
 			Ok::<_, crate::ClientError>(client)
 		}
@@ -126,7 +134,7 @@ pub fn run(cmd: CliCommand) -> anyhow::Result<()> {
 		match tokio_handle.block_on(signals.try_until_signal(fut)) {
 			Ok(Ok(client)) => rpc_module(is_dev, client),
 			Ok(Err(err)) => {
-				log::error!("Error connecting to the node at {node_rpc_url}: {err}");
+				log::error!("Error initializing the rpc: {err}");
 				Err(sc_service::Error::Application(err.into()))
 			},
 			Err(_) => Err(sc_service::Error::Application("Client connection interrupted".into())),

@@ -31,38 +31,104 @@ use pallet_revive::{
 	create1,
 	evm::{GenericTransaction, Log, ReceiptInfo, TransactionSigned, H256, U256},
 };
-use sp_core::{keccak_256, H160};
+use sp_core::keccak_256;
 
-pub mod cache;
+mod cache;
 pub use cache::CacheReceiptProvider;
 
+mod db;
+pub use db::DBReceiptProvider;
+
 #[async_trait]
-pub trait ReceiptProvider {
-	async fn insert(&self, block_hash: H256, receipts: Vec<(TransactionSigned, ReceiptInfo)>);
-	async fn remove(&self, block_hash: H256);
+pub trait ReceiptProvider: Send + Sync {
+	/// Insert receipts into the provider.
+	async fn insert(&self, block_hash: &H256, receipts: &[(TransactionSigned, ReceiptInfo)]);
+
+	/// Remove receipts from the provider with the given block hash.
+	async fn remove(&self, block_hash: &H256);
+
+	/// Get the receipt for the given block hash and transaction index.
 	async fn receipt_by_block_hash_and_index(
 		&self,
 		block_hash: &H256,
 		transaction_index: &U256,
 	) -> Option<ReceiptInfo>;
+
+	/// Get the number of receipts per block.
 	async fn receipts_count_per_block(&self, block_hash: &H256) -> Option<usize>;
-	async fn receipt_by_hash(&self, hash: &H256) -> Option<ReceiptInfo>;
-	async fn signed_tx_by_hash(&self, hash: &H256) -> Option<TransactionSigned>;
+
+	/// Get the receipt for the given transaction hash.
+	async fn receipt_by_hash(&self, transaction_hash: &H256) -> Option<ReceiptInfo>;
+
+	/// Get the signed transaction for the given transaction hash.
+	async fn signed_tx_by_hash(&self, transaction_hash: &H256) -> Option<TransactionSigned>;
 }
 
-/// Extract the receipt information from an extrinsic.
+#[async_trait]
+impl<Main: ReceiptProvider, Fallback: ReceiptProvider> ReceiptProvider for (Main, Fallback) {
+	async fn insert(&self, block_hash: &H256, receipts: &[(TransactionSigned, ReceiptInfo)]) {
+		self.0.insert(block_hash, receipts).await;
+		self.1.insert(block_hash, receipts).await;
+	}
+
+	async fn remove(&self, block_hash: &H256) {
+		self.0.remove(block_hash).await;
+		self.1.remove(block_hash).await;
+	}
+
+	async fn receipt_by_block_hash_and_index(
+		&self,
+		block_hash: &H256,
+		transaction_index: &U256,
+	) -> Option<ReceiptInfo> {
+		if let Some(receipt) =
+			self.0.receipt_by_block_hash_and_index(block_hash, transaction_index).await
+		{
+			return Some(receipt);
+		}
+
+		self.1.receipt_by_block_hash_and_index(block_hash, transaction_index).await
+	}
+
+	async fn receipts_count_per_block(&self, block_hash: &H256) -> Option<usize> {
+		if let Some(count) = self.0.receipts_count_per_block(block_hash).await {
+			return Some(count);
+		}
+		self.1.receipts_count_per_block(block_hash).await
+	}
+
+	async fn receipt_by_hash(&self, hash: &H256) -> Option<ReceiptInfo> {
+		if let Some(receipt) = self.0.receipt_by_hash(hash).await {
+			return Some(receipt);
+		}
+		self.1.receipt_by_hash(hash).await
+	}
+
+	async fn signed_tx_by_hash(&self, hash: &H256) -> Option<TransactionSigned> {
+		if let Some(tx) = self.0.signed_tx_by_hash(hash).await {
+			return Some(tx);
+		}
+		self.1.signed_tx_by_hash(hash).await
+	}
+}
+
+/// Extract a [`TransactionSigned`] and a [`ReceiptInfo`] and  from an extrinsic.
 pub async fn extract_receipt_from_extrinsic(
-	block_number: U256,
-	block_hash: H256,
-	from: H160,
-	tx_info: GenericTransaction,
-	transaction_hash: H256,
-	contract_address: Option<H160>,
+	block: &SubstrateBlock,
 	ext: subxt::blocks::ExtrinsicDetails<SrcChainConfig, subxt::OnlineClient<SrcChainConfig>>,
-) -> Result<ReceiptInfo, ClientError> {
+	call: EthTransact,
+) -> Result<(TransactionSigned, ReceiptInfo), ClientError> {
 	let events = ext.events().await?;
 	let tx_fees = events.find_first::<TransactionFeePaid>()?.ok_or(ClientError::TxFeeNotFound)?;
+	let transaction_hash = H256(keccak_256(&call.payload));
 
+	let signed_tx =
+		TransactionSigned::decode(&call.payload).map_err(|_| ClientError::TxDecodingFailed)?;
+	let from = signed_tx
+		.recover_eth_address()
+		.map_err(|_| ClientError::RecoverEthAddressFailed)?;
+
+	let tx_info = GenericTransaction::from_signed(signed_tx.clone(), Some(from));
 	let gas_price = tx_info.gas_price.unwrap_or_default();
 	let gas_used = (tx_fees.tip.saturating_add(tx_fees.actual_fee))
 		.checked_div(gas_price.as_u128())
@@ -70,6 +136,8 @@ pub async fn extract_receipt_from_extrinsic(
 
 	let success = events.has::<ExtrinsicSuccess>()?;
 	let transaction_index = ext.index();
+	let block_number = U256::from(block.number());
+	let block_hash = block.hash();
 
 	// get logs from ContractEmitted event
 	let logs = events
@@ -92,7 +160,21 @@ pub async fn extract_receipt_from_extrinsic(
 		})
 		.collect();
 
-	log::debug!(target: LOG_TARGET, "Adding receipt for tx hash: {transaction_hash:?} - block: {block_number:?}");
+	let contract_address = if tx_info.to.is_none() {
+		Some(create1(
+			&from,
+			tx_info
+				.nonce
+				.unwrap_or_default()
+				.try_into()
+				.map_err(|_| ClientError::ConversionFailed)?,
+		))
+	} else {
+		None
+	};
+
+	log::debug!(target: LOG_TARGET, "Adding receipt for tx hash: {transaction_hash:?} - block:
+	 {block_number:?}");
 	let receipt = ReceiptInfo::new(
 		block_hash,
 		block_number,
@@ -107,52 +189,42 @@ pub async fn extract_receipt_from_extrinsic(
 		transaction_index.into(),
 		tx_info.r#type.unwrap_or_default(),
 	);
-
-	Ok(receipt)
+	Ok((signed_tx, receipt))
 }
 
 ///  Extract receipts from block.
-pub async fn receipt_infos(
+pub async fn extract_receipts_from_block(
 	block: &SubstrateBlock,
 ) -> Result<Vec<(TransactionSigned, ReceiptInfo)>, ClientError> {
-	// Get extrinsics from the block
-	let extrinsics = block.extrinsics().await?;
-	let block_hash = block.hash();
-	let block_number = U256::from(block.number());
-
 	// Filter extrinsics from pallet_revive
+	let extrinsics = block.extrinsics().await?;
 	let extrinsics = extrinsics.iter().flat_map(|ext| {
 		let call = ext.as_extrinsic::<EthTransact>().ok()??;
-		let transaction_hash = H256(keccak_256(&call.payload));
-		let signed_tx = TransactionSigned::decode(&call.payload).ok()?;
-		let from = signed_tx.recover_eth_address().ok()?;
-		let tx_info = GenericTransaction::from_signed(signed_tx.clone(), Some(from));
-		let contract_address = if tx_info.to.is_none() {
-			Some(create1(&from, tx_info.nonce.unwrap_or_default().try_into().ok()?))
-		} else {
-			None
-		};
-
-		Some((from, signed_tx, tx_info, transaction_hash, contract_address, ext))
+		Some((ext, call))
 	});
 
 	stream::iter(extrinsics)
-		.map(|(from, signed_tx, tx_info, transaction_hash, contract_address, ext)| async move {
-			let receipt = extract_receipt_from_extrinsic(
-				block_number,
-				block_hash,
-				from,
-				tx_info,
-				transaction_hash,
-				contract_address,
-				ext,
-			)
-			.await?;
-			Ok((signed_tx, receipt))
-		})
+		.map(|(ext, call)| async move { extract_receipt_from_extrinsic(block, ext, call).await })
 		.buffer_unordered(10)
 		.collect::<Vec<Result<_, _>>>()
 		.await
 		.into_iter()
 		.collect::<Result<Vec<_>, _>>()
+}
+
+///  Extract receipt from transaction
+pub async fn extract_receipts_from_transaction(
+	block: &SubstrateBlock,
+	transaction_index: usize,
+) -> Result<(TransactionSigned, ReceiptInfo), ClientError> {
+	let extrinsics = block.extrinsics().await?;
+	let ext = extrinsics
+		.iter()
+		.nth(transaction_index)
+		.ok_or(ClientError::EthExtrinsicNotFound)?;
+
+	let call = ext
+		.as_extrinsic::<EthTransact>()?
+		.ok_or_else(|| ClientError::EthExtrinsicNotFound)?;
+	extract_receipt_from_extrinsic(block, ext, call).await
 }
