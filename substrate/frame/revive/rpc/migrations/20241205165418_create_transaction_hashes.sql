@@ -2,7 +2,7 @@
 -- DATABASE_URL="..." cargo sqlx database create
 --
 -- Run migration:
--- DATABASE_URL="..." cargo sqlx migration run
+-- DATABASE_URL="..." cargo sqlx migrate run
 --
 -- Update compile time artifacts:
 -- DATABASE_URL="..." cargo sqlx prepare
