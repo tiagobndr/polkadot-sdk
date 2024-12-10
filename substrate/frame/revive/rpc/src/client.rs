@@ -233,7 +233,11 @@ async fn extract_block_timestamp(block: &SubstrateBlock) -> Option<u64> {
 
 impl Client {
 	/// Create a new client instance connecting to the substrate node at the given URL.
-	pub async fn new(node_rpc_url: &str, database_url: Option<&str>) -> Result<Self, ClientError> {
+	pub async fn new(
+		cache_size: usize,
+		node_rpc_url: &str,
+		database_url: Option<&str>,
+	) -> Result<Self, ClientError> {
 		log::info!(target: LOG_TARGET, "Connecting to node at: {node_rpc_url} ...");
 		let rpc_client = ReconnectingRpcClient::builder()
 			.retry_policy(ExponentialBackoff::from_millis(100).max_delay(Duration::from_secs(10)))
@@ -244,7 +248,7 @@ impl Client {
 		let api = OnlineClient::<SrcChainConfig>::from_rpc_client(rpc_client.clone()).await?;
 		let rpc = LegacyRpcMethods::<SrcChainConfig>::new(RpcClient::new(rpc_client.clone()));
 
-		let block_provider = BlockInfoProvider::new(api.clone(), rpc.clone());
+		let block_provider = BlockInfoProvider::new(cache_size, api.clone(), rpc.clone());
 		let receipt_provider: Arc<dyn ReceiptProvider> = if let Some(database_url) = database_url {
 			Arc::new((
 				CacheReceiptProvider::default(),

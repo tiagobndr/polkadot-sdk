@@ -42,6 +42,10 @@ pub struct CliCommand {
 	#[clap(long, default_value = "ws://127.0.0.1:9944")]
 	pub node_rpc_url: String,
 
+	/// The maximum number of blocks to cache in memory.
+	#[clap(long, default_value = "256")]
+	pub cache_size: usize,
+
 	/// The database used to store Ethereum transaction hashes.
 	/// This is only useful if the node needs to act as an archive node and respond to Ethereum RPC
 	/// querires for transactions that are not in the in memory cache.
@@ -85,7 +89,13 @@ fn init_logger(params: &SharedParams) -> anyhow::Result<()> {
 /// Start the JSON-RPC server using the given command line arguments.
 pub fn run(cmd: CliCommand) -> anyhow::Result<()> {
 	let CliCommand {
-		rpc_params, prometheus_params, node_rpc_url, database_url, shared_params, ..
+		rpc_params,
+		prometheus_params,
+		node_rpc_url,
+		cache_size,
+		database_url,
+		shared_params,
+		..
 	} = cmd;
 
 	#[cfg(not(test))]
@@ -124,7 +134,7 @@ pub fn run(cmd: CliCommand) -> anyhow::Result<()> {
 	let gen_rpc_module = || {
 		let signals = tokio_runtime.block_on(async { Signals::capture() })?;
 		let fut = async {
-			let client = Client::new(&node_rpc_url, database_url.as_deref()).await?;
+			let client = Client::new(cache_size, &node_rpc_url, database_url.as_deref()).await?;
 			client.subscribe_and_cache_blocks(&essential_spawn_handle);
 			Ok::<_, crate::ClientError>(client)
 		}

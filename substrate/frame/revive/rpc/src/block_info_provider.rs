@@ -28,59 +28,25 @@ use std::{
 use subxt::{backend::legacy::LegacyRpcMethods, OnlineClient};
 use tokio::sync::RwLock;
 
-/// The number of recent blocks maintained by the cache.
-const CACHE_SIZE: usize = 256;
-
-/// Provides information about a block,
-/// This is an abstratction on top of [`SubstrateBlock`] to provide a common interface for
-/// [`BlockCache`].
-trait BlockInfo {
-	/// Returns the block hash.
-	fn hash(&self) -> H256;
-	/// Returns the block number.
-	fn number(&self) -> SubstrateBlockNumber;
-}
-
-impl BlockInfo for SubstrateBlock {
-	fn hash(&self) -> H256 {
-		SubstrateBlock::hash(self)
-	}
-	fn number(&self) -> u32 {
-		SubstrateBlock::number(self)
-	}
-}
-
-/// The cache maintains a buffer of the last N blocks,
-#[derive(frame_support::DefaultNoBound)]
-struct BlockCache<const N: usize, Block> {
-	/// A double-ended queue of the last N blocks.
-	/// The most recent block is at the back of the queue, and the oldest block is at the front.
-	buffer: VecDeque<Arc<Block>>,
-
-	/// A map of blocks by block number.
-	blocks_by_number: HashMap<SubstrateBlockNumber, Arc<Block>>,
-
-	/// A map of blocks by block hash.
-	blocks_by_hash: HashMap<H256, Arc<Block>>,
-}
-
 #[derive(frame_support::CloneNoBound)]
 pub struct BlockInfoProvider {
-	cache: Arc<RwLock<BlockCache<CACHE_SIZE, SubstrateBlock>>>,
+	cache: Arc<RwLock<BlockCache<SubstrateBlock>>>,
 	rpc: LegacyRpcMethods<SrcChainConfig>,
 	api: OnlineClient<SrcChainConfig>,
 }
 
 impl BlockInfoProvider {
 	/// Create a new `BlockInfoProvider` with the given rpc client.
-	pub fn new(api: OnlineClient<SrcChainConfig>, rpc: LegacyRpcMethods<SrcChainConfig>) -> Self {
-		Self { api, rpc, cache: Default::default() }
+	pub fn new(
+		cache_size: usize,
+		api: OnlineClient<SrcChainConfig>,
+		rpc: LegacyRpcMethods<SrcChainConfig>,
+	) -> Self {
+		Self { api, rpc, cache: Arc::new(RwLock::new(BlockCache::new(cache_size))) }
 	}
 
 	/// Get a read access on the shared cache.
-	async fn cache(
-		&self,
-	) -> tokio::sync::RwLockReadGuard<'_, BlockCache<CACHE_SIZE, SubstrateBlock>> {
+	async fn cache(&self) -> tokio::sync::RwLockReadGuard<'_, BlockCache<SubstrateBlock>> {
 		self.cache.read().await
 	}
 
@@ -131,11 +97,57 @@ impl BlockInfoProvider {
 	}
 }
 
-impl<const N: usize, B: BlockInfo> BlockCache<N, B> {
+/// The cache maintains a buffer of the last N blocks,
+#[derive(frame_support::DefaultNoBound)]
+struct BlockCache<Block> {
+	/// The maximum buffer's size.
+	max_cache_size: usize,
+
+	/// A double-ended queue of the last N blocks.
+	/// The most recent block is at the back of the queue, and the oldest block is at the front.
+	buffer: VecDeque<Arc<Block>>,
+
+	/// A map of blocks by block number.
+	blocks_by_number: HashMap<SubstrateBlockNumber, Arc<Block>>,
+
+	/// A map of blocks by block hash.
+	blocks_by_hash: HashMap<H256, Arc<Block>>,
+}
+
+/// Provides information about a block,
+/// This is an abstratction on top of [`SubstrateBlock`] to provide a common interface for
+/// [`BlockCache`].
+trait BlockInfo {
+	/// Returns the block hash.
+	fn hash(&self) -> H256;
+	/// Returns the block number.
+	fn number(&self) -> SubstrateBlockNumber;
+}
+
+impl BlockInfo for SubstrateBlock {
+	fn hash(&self) -> H256 {
+		SubstrateBlock::hash(self)
+	}
+	fn number(&self) -> u32 {
+		SubstrateBlock::number(self)
+	}
+}
+
+impl<B: BlockInfo> BlockCache<B> {
+	/// Create a new cache with the given maximum buffer size.
+	pub fn new(max_cache_size: usize) -> Self {
+		Self {
+			max_cache_size,
+			buffer: Default::default(),
+			blocks_by_number: Default::default(),
+			blocks_by_hash: Default::default(),
+		}
+	}
+
 	/// Insert an entry into the cache, and prune the oldest entry if the cache is full.
 	pub fn insert(&mut self, block: B) -> Option<H256> {
 		let mut pruned_block_hash = None;
-		if self.buffer.len() >= N {
+		if self.buffer.len() >= self.max_cache_size {
 			if let Some(block) = self.buffer.pop_front() {
 				log::trace!(target: LOG_TARGET, "Pruning block: {}", block.number());
 				let hash = block.hash();
@@ -174,7 +186,7 @@ mod test {
 
 	#[test]
 	fn cache_insert_works() {
-		let mut cache = BlockCache::<2, MockBlock>::default();
+		let mut cache = BlockCache::<MockBlock>::new(2);
 
 		let pruned = cache.insert(MockBlock { block_number: 1, block_hash: H256::from([1; 32]) });
 		assert_eq!(pruned, None);
