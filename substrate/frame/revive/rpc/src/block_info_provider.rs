@@ -29,7 +29,7 @@ use subxt::{backend::legacy::LegacyRpcMethods, OnlineClient};
 use tokio::sync::RwLock;
 
 /// Provides information about blocks.
-#[derive(frame_support::CloneNoBound)]
+#[derive(Clone)]
 pub struct BlockInfoProvider {
 	/// The shared in memory cache.
 	cache: Arc<RwLock<BlockCache<SubstrateBlock>>>,
@@ -104,7 +104,6 @@ impl BlockInfoProvider {
 }
 
 /// The cache maintains a buffer of the last N blocks,
-#[derive(frame_support::DefaultNoBound)]
 struct BlockCache<Block> {
 	/// The maximum buffer's size.
 	max_cache_size: usize,

@@ -32,6 +32,7 @@ use pallet_revive::{
 	evm::{GenericTransaction, Log, ReceiptInfo, TransactionSigned, H256, U256},
 };
 use sp_core::keccak_256;
+use tokio::join;
 
 mod cache;
 pub use cache::CacheReceiptProvider;
@@ -68,13 +69,11 @@ pub trait ReceiptProvider: Send + Sync {
 #[async_trait]
 impl<Main: ReceiptProvider, Fallback: ReceiptProvider> ReceiptProvider for (Main, Fallback) {
 	async fn insert(&self, block_hash: &H256, receipts: &[(TransactionSigned, ReceiptInfo)]) {
-		self.0.insert(block_hash, receipts).await;
-		self.1.insert(block_hash, receipts).await;
+		join!(self.0.insert(block_hash, receipts), self.1.insert(block_hash, receipts));
 	}
 
 	async fn remove(&self, block_hash: &H256) {
-		self.0.remove(block_hash).await;
-		self.1.remove(block_hash).await;
+		join!(self.0.remove(block_hash), self.1.remove(block_hash));
 	}
 
 	async fn receipt_by_block_hash_and_index(
