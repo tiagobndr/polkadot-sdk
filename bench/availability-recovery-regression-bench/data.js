@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1734345278470,
+  "lastUpdate": 1734370440678,
   "repoUrl": "https://github.com/paritytech/polkadot-sdk",
   "entries": {
     "availability-recovery-regression-bench": [
@@ -34619,6 +34619,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "test-environment",
             "value": 0.23601142683333337,
+            "unit": "seconds"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jasl9187@hotmail.com",
+            "name": "Jun Jiang",
+            "username": "jasl"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5b04b4598cc7b2c8e817a6304c7cdfaf002c1fee",
+          "message": "Upgrade nix and reqwest (#6898)\n\n# Description\n\nUpgrade `nix` and `reqwest` to reduce outdated dependencies and speed up\ncompilation.",
+          "timestamp": "2024-12-16T16:29:46Z",
+          "tree_id": "064582ae10de584b0ae0b7587a13d78ff338c3d8",
+          "url": "https://github.com/paritytech/polkadot-sdk/commit/5b04b4598cc7b2c8e817a6304c7cdfaf002c1fee"
+        },
+        "date": 1734370420937,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Received from peers",
+            "value": 307203,
+            "unit": "KiB"
+          },
+          {
+            "name": "Sent to peers",
+            "value": 1.6666666666666665,
+            "unit": "KiB"
+          },
+          {
+            "name": "availability-recovery",
+            "value": 11.588658406233332,
+            "unit": "seconds"
+          },
+          {
+            "name": "test-environment",
+            "value": 0.23297174026666673,
             "unit": "seconds"
           }
         ]
